@@ -8,9 +8,10 @@ OS=$(uname -s)
 
 # Setup RISCV environment variables. Ensure that riscv/esp-tools GCC is in your path.
 # By default, we assume we are building for systolic only, so riscv-tools suffices with standard target
+export PATH="/root/projects/chipyard/.conda-env/riscv-tools/bin:${PATH}"
 export CXX=riscv64-unknown-linux-gnu-g++
 export CC=riscv64-unknown-linux-gnu-gcc
-export CXXFLAGS="-march=rv64imafdc -mabi=lp64d"
+export CXXFLAGS="-march=rv64imafdc -mabi=lp64d -Wno-error=type-limits"
 
 BUILD_TYPE="Debug"
 for var in "$@"
@@ -21,11 +22,12 @@ do
 	if [ $var = "--use_hwacha" ]; then
 		echo "Building with hwacha support"
 		# Note that CFLAGS needs to be set for assembler to pickup
-		export CXXFLAGS="-march=rv64gcxhwacha -mabi=lp64d"
+		export CXXFLAGS="-march=rv64gcxhwacha -mabi=lp64d -Wno-error=type-limits"
 		export CFLAGS="-march=rv64gcxhwacha -mabi=lp64d"
 	fi
 done
 
+EXTRA_DEFINES="--cmake_extra_defines CMAKE_CXX_FLAGS=-Wno-error=type-limits CMAKE_C_FLAGS=-Wno-error=type-limits onnxruntime_BUILD_UNIT_TESTS=OFF"
 
 echo "Performing ${BUILD_TYPE} build"
 
@@ -41,7 +43,7 @@ cd $DIR
 
 # NOTE: If you're NOT building for the first time adding "--parallel" when invoking this script will parallelize build
 # requires python3.6 or higher
-python3 $DIR/tools/ci_build/build.py --riscv --skip_submodule_sync --update --build --build_dir=build "$@"
+python3 $DIR/tools/ci_build/build.py --riscv --skip_submodule_sync --update --build --build_dir=build $EXTRA_DEFINES "$@"
 
 
 # Note that if you ever want to use the onnx_test_runner then you'll probably have to uncomment the below,
