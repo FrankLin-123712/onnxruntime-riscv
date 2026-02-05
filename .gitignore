@@ -53,5 +53,6 @@ onnxruntime/python/version_info.py
 /tools/perf_util/src/main/resources
 
 # executable and linkable files
-*elf
+dpvo_runner
+images/*
 
