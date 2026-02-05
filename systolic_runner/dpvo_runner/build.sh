@@ -34,9 +34,13 @@ for var in "$@"; do
         echo "Building with DPVO_ORT_DEBUG enabled"
         extra_defs="-DDPVO_ORT_DEBUG=1 ${extra_defs}"
     fi
+    if [ "$var" = "--print_info" ]; then
+        echo "Building with PRINT_INFO enabled"
+        extra_defs="-DPRINT_INFO ${extra_defs}"
+    fi
 done
 
 rm -f dpvo_runner
 make -s -j16 dpvo_runner root_path="${root_path}" build_path="${build_path}" extra_libs="${extra_libs}" \
                        extra_defs="${extra_defs}" training_libs="${training_libs}" extra_providers="${extra_providers}"
-echo "Done. dpvo_runner built (custom dpvo::scatter_max CPU kernel registered; corr/BA still CPU placeholders)."
+echo "Done. dpvo_runner built (split into main/dpvo/custom_op/cmd_arg/utils; custom dpvo::scatter_max CPU kernel registered; corr/BA still CPU placeholders)."
