@@ -30,9 +30,13 @@ for var in "$@"; do
         extra_libs="${build_path}/tensorboard/libtensorboard.a ${extra_libs}"
         training_libs="${build_path}/libonnxruntime_training_runner.a ${build_path}/libonnxruntime_training.a"
     fi
+    if [ "$var" = "--ort_debug" ]; then
+        echo "Building with DPVO_ORT_DEBUG enabled"
+        extra_defs="-DDPVO_ORT_DEBUG=1 ${extra_defs}"
+    fi
 done
 
 rm -f dpvo_runner
 make -s -j16 dpvo_runner root_path="${root_path}" build_path="${build_path}" extra_libs="${extra_libs}" \
                        extra_defs="${extra_defs}" training_libs="${training_libs}" extra_providers="${extra_providers}"
-echo "Done. dpvo_runner built (placeholders for correlation/BA)."
+echo "Done. dpvo_runner built (custom dpvo::scatter_max CPU kernel registered; corr/BA still CPU placeholders)."
