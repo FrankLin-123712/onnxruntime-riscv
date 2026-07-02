@@ -111,7 +111,11 @@ Return Value:
         q = MlasMultiplyAddFloat32x4(q, ValueSquared, MlasBroadcastFloat32x4(MlasLogisticConstants.beta_2));
         q = MlasMultiplyAddFloat32x4(q, ValueSquared, MlasBroadcastFloat32x4(MlasLogisticConstants.beta_0));
 
-        MlasStoreFloat32x4(Output, MlasAddFloat32x4(MlasDivideFloat32x4(p, q), MlasBroadcastFloat32x4(0.5f)));
+        MLAS_FLOAT32X4 Result =
+            MlasAddFloat32x4(MlasDivideFloat32x4(p, q), MlasBroadcastFloat32x4(0.5f));
+        Result = MlasMaximumFloat32x4(MlasZeroFloat32x4(), Result);
+        Result = MlasMinimumFloat32x4(MlasBroadcastFloat32x4(1.0f), Result);
+        MlasStoreFloat32x4(Output, Result);
 
         Input += 4;
         Output += 4;
@@ -141,7 +145,9 @@ Return Value:
         q = q * ValueSquared + MlasLogisticConstants.beta_2;
         q = q * ValueSquared + MlasLogisticConstants.beta_0;
 
-        *Output++ = (p / q) + 0.5f;
+        float Result = (p / q) + 0.5f;
+        Result = std::min(std::max(Result, 0.0f), 1.0f);
+        *Output++ = Result;
 
         N -= 1;
     }

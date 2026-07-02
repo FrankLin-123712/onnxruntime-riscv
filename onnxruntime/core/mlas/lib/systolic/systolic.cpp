@@ -362,10 +362,16 @@ void SystolicConvBackpropFilter(char accelerator_mode, int batch_size, int in_di
                   get_accelerator_mode(accelerator_mode));
 }
 
+void SystolicFlush() {
+  // FLUSH does not wait for queued Gemmini commands, so drain them first.
+  gemmini_fence();
+  gemmini_flush(0);
+}
+
 // We do this to clear out gemmini on every process launch
 #ifdef FOR_FIRESIM
 __attribute__((constructor))
 void cleargemmini() {
-  gemmini_flush(0);
+  SystolicFlush();
 }
 #endif

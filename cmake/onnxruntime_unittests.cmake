@@ -689,6 +689,15 @@ AddTest(
 # the default logger tests conflict with the need to have an overall default logger
 # so skip in this type of
 target_compile_definitions(onnxruntime_test_all PUBLIC -DSKIP_DEFAULT_LOGGER_TESTS)
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(riscv.*|RISCV.*)" AND
+   CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND
+   CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 13)
+  # GCC 13 can report false-positive maybe-uninitialized warnings while
+  # inlining std::function copies in the legacy control-flow unit tests.
+  set_property(
+    SOURCE "${TEST_SRC_DIR}/providers/cpu/controlflow/loop_test.cc"
+    APPEND PROPERTY COMPILE_OPTIONS -Wno-error=maybe-uninitialized)
+endif()
 if (CMAKE_SYSTEM_NAME STREQUAL "iOS")
   target_compile_definitions(onnxruntime_test_all_xc PUBLIC -DSKIP_DEFAULT_LOGGER_TESTS)
 endif()

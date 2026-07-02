@@ -1,3 +1,5 @@
+void SystolicFlush();
+
 #ifdef SYSTOLIC_INT8
 
 void SystolicMultiply

@@ -428,6 +428,10 @@ endif ()
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(riscv.*|RISCV.*)")
   # For riscv platform
   set(onnxruntime_LINK_LIBATOMIC true)
+  # RISC-V GCC defaults plain char to unsigned, while several dependencies in
+  # this ORT snapshot assume signed-char semantics.
+  string(APPEND CMAKE_C_FLAGS " -fsigned-char")
+  string(APPEND CMAKE_CXX_FLAGS " -fsigned-char")
 endif()
 
 set(REPO_ROOT ${PROJECT_SOURCE_DIR}/..)
@@ -713,6 +717,13 @@ if(Protobuf_FOUND OR Protobuf_FOUND)
 else()
   message("Use protobuf from submodule")
   # use protobuf as a submodule
+  # Do not let a host-side zlib package inject its include directory ahead of
+  # the vendored protobuf headers while cross-compiling. Protobuf's zlib
+  # support is optional, and the host library cannot be linked into RISC-V
+  # binaries anyway.
+  if(CMAKE_CROSSCOMPILING)
+    set(protobuf_WITH_ZLIB OFF CACHE BOOL "Build protobuf with zlib support" FORCE)
+  endif()
   if (CMAKE_SYSTEM_NAME STREQUAL "Android")
     set(protobuf_BUILD_PROTOC_BINARIES OFF CACHE BOOL "Build protobuf tests" FORCE)
   endif()
@@ -1275,6 +1286,18 @@ set(FLATBUFFERS_BUILD_FLATHASH OFF CACHE BOOL "FLATBUFFERS_BUILD_FLATHASH" FORCE
 set(FLATBUFFERS_BUILD_FLATLIB ON CACHE BOOL "FLATBUFFERS_BUILD_FLATLIB" FORCE)
 set_msvc_c_cpp_compiler_warning_level(4)
 add_subdirectory(external/flatbuffers EXCLUDE_FROM_ALL)
+
+# FlatBuffers in this ORT snapshot predates GCC 13 and triggers a false-positive
+# stringop-overflow warning in std::vector::insert. Keep warnings-as-errors for
+# the rest of ORT, but do not promote this warning for the vendored targets.
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND
+   CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 13)
+  target_compile_options(flatbuffers PRIVATE -Wno-error=stringop-overflow)
+  if(TARGET flatc)
+    target_compile_options(flatc PRIVATE -Wno-error=stringop-overflow)
+  endif()
+endif()
+
 set_msvc_c_cpp_compiler_warning_level(3)
 list(APPEND onnxruntime_EXTERNAL_DEPENDENCIES flatbuffers)
 list(APPEND onnxruntime_EXTERNAL_LIBRARIES flatbuffers)

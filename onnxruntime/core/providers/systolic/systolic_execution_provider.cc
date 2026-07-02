@@ -4,6 +4,7 @@
 #include "core/providers/systolic/systolic_execution_provider.h"
 #include "core/framework/op_kernel.h"
 #include "core/framework/kernel_registry.h"
+#include "core/mlas/inc/mlas.h"
 #include "systolic_fwd.h"
 #include "core/framework/compute_capability.h"
 
@@ -106,6 +107,14 @@ std::unique_ptr<IDataTransfer> SystolicExecutionProvider::GetDataTransfer() cons
 
 char SystolicExecutionProvider::GetAcceleratorMode() const {
   return provider_info_.accelerator_mode;
+}
+
+Status SystolicExecutionProvider::OnRunStart() {
+  // CPU mode (0) must not issue RoCC instructions; this also keeps QEMU usable.
+  if (provider_info_.accelerator_mode > 0) {
+    SystolicFlush();
+  }
+  return Status::OK();
 }
 
 std::vector<std::unique_ptr<ComputeCapability>>
