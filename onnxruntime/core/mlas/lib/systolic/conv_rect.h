@@ -43,7 +43,7 @@ inline bool Supported(const Shape& s) {
          uint64_t(s.batch) * s.oh * s.ow * s.co <= max_elements;
 }
 
-inline Tile SelectTile(const Shape& s, int dim, int sp_rows, int acc_rows) {
+inline Tile FixedTile(const Shape& s, int dim, int sp_rows, int acc_rows) {
   Tile t{1, int(std::min<int64_t>(dim, s.ow)),
          int(std::min<int64_t>(dim, s.ci)), int(std::min<int64_t>(dim, s.co))};
   while (!Fits(s, t, dim, sp_rows, acc_rows)) {
@@ -52,6 +52,39 @@ inline Tile SelectTile(const Shape& s, int dim, int sp_rows, int acc_rows) {
     else return {0, 0, 0, 0};
   }
   return t;
+}
+
+inline double LoopCount(const Shape& s, const Tile& t) {
+  return double(s.batch) * Blocks(s.oh, t.rows) * Blocks(s.ow, t.cols) *
+         Blocks(s.ci, t.ci) * Blocks(s.co, t.co);
+}
+
+inline Tile SelectTile(const Shape& s, int dim, int sp_rows, int acc_rows) {
+  const Tile fixed = FixedTile(s, dim, sp_rows, acc_rows);
+  if (!fixed.rows) return fixed;
+  Tile best = fixed;
+  double best_loops = LoopCount(s, best);
+  double best_loads = std::numeric_limits<double>::infinity();
+  auto next = [](int v, int64_t limit) { return int(v == limit ? limit + 1 : std::min<int64_t>(2 * v, limit)); };
+  // Power-of-two growth plus exact dimension tails bounds the search. Retain
+  // the stage-1 tile as a candidate; reserve half of each on-chip memory.
+  for (int r = 1; r <= s.oh; r = next(r, s.oh))
+    for (int c = fixed.cols; c <= s.ow; c = next(c, s.ow))
+      for (int ci = fixed.ci; ci <= s.ci; ci = next(ci, s.ci))
+        for (int co = fixed.co; co <= s.co; co = next(co, s.co)) {
+          const Tile t{r, c, ci, co};
+          if (!Fits(s, t, dim, sp_rows, acc_rows)) continue;
+          const double loops = LoopCount(s, t);
+          // Logical load estimate, not measured DMA traffic. Break equal loop
+          // counts in favor of less repeated input/weight loading.
+          const double loads = loops * (
+              double(r * s.stride + s.kernel - 1) * (c * s.stride + s.kernel - 1) * ci +
+              double(s.kernel) * s.kernel * ci * co);
+          if (loops < best_loops || (loops == best_loops && loads < best_loads)) {
+            best = t; best_loops = loops; best_loads = loads;
+          }
+        }
+  return best;
 }
 
 // emit(funct, rs1, rs2): one custom instruction, all operands in element units

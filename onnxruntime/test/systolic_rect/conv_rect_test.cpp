@@ -108,5 +108,41 @@ int main() {
   }
   Require(!systolic_rect::Supported({1,9,13,3,16,9,12,3,1,1}),"bad output accepted");
   Require(!systolic_rect::Supported({1,9,70000,3,16,9,70000,3,1,1}),"ABI overflow accepted");
+  // Shapes from the 2026-09-14 Patchify nodes trace; static loop counts
+  // are not measured cycles or DMA traffic.
+  const Shape workload[] = {
+    {1,480,752,3,32,240,376,7,2,3},
+    {1,240,376,32,32,240,376,3,1,1},
+    {1,240,376,32,32,240,376,3,1,1},
+    {1,240,376,32,32,240,376,3,1,1},
+    {1,240,376,32,32,240,376,3,1,1},
+    {1,240,376,32,64,120,188,1,2,0},
+    {1,240,376,32,64,120,188,3,2,1},
+    {1,120,188,64,64,120,188,3,1,1},
+    {1,120,188,64,64,120,188,3,1,1},
+    {1,120,188,64,64,120,188,3,1,1},
+    {1,120,188,64,384,120,188,1,1,0},
+    {1,480,752,3,32,240,376,7,2,3},
+    {1,240,376,32,32,240,376,3,1,1},
+    {1,240,376,32,32,240,376,3,1,1},
+    {1,240,376,32,32,240,376,3,1,1},
+    {1,240,376,32,32,240,376,3,1,1},
+    {1,240,376,32,64,120,188,1,2,0},
+    {1,240,376,32,64,120,188,3,2,1},
+    {1,120,188,64,64,120,188,3,1,1},
+    {1,120,188,64,64,120,188,3,1,1},
+    {1,120,188,64,64,120,188,3,1,1},
+    {1,120,188,64,128,120,188,1,1,0},
+  };
+  double fixed_total=0, selected_total=0;
+  for (const auto& s : workload) {
+    Require(systolic_rect::Supported(s), "DPVO shape rejected");
+    const auto fixed=systolic_rect::FixedTile(s,16,4096,1024);
+    const auto selected=systolic_rect::SelectTile(s,16,4096,1024);
+    Require(selected.rows && systolic_rect::Fits(s,selected,16,4096,1024),"DPVO tile overflow");
+    const double f=systolic_rect::LoopCount(s,fixed), v=systolic_rect::LoopCount(s,selected);
+    Require(v<=f,"selected tile increases command count"); fixed_total+=f; selected_total+=v;
+  }
+  std::printf("DPVO22 loops fixed=%.0f selected=%.0f (command count, not cycles)\n",fixed_total,selected_total);
   std::puts("all 18 rectangular/square convolution cases passed");
 }

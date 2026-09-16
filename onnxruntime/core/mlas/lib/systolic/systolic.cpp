@@ -31,7 +31,13 @@ bool SystolicConvRect(char accelerator_mode, int64_t batch,
   const auto tile = systolic_rect::SelectTile(s, DIM, BANK_NUM * BANK_ROWS, ACC_ROWS);
   if (!tile.rows) return false;
   ort_replay::Scope profile("kernel", "conv.direct", "Conv", "SystolicExecutionProvider");
-  if (profile.Active()) profile.Detail("path=direct_conv;layout=NHWC;abi=rect_v1;tiling=fixed_v1");
+  if (profile.Active()) {
+    const std::string detail = "path=direct_conv;layout=NHWC;abi=rect_v1;tiling=capacity_v2;tile=" +
+        std::to_string(tile.rows) + "x" + std::to_string(tile.cols) + "x" +
+        std::to_string(tile.ci) + "x" + std::to_string(tile.co) +
+        ";loops=" + std::to_string(static_cast<uint64_t>(systolic_rect::LoopCount(s, tile)));
+    profile.Detail(detail.c_str());
+  }
   gemmini_extended_config_st(output_channels * sizeof(float), relu, output_scale);
   // Explicitly disable the separate HW Im2Col unit, even after a prior user.
   gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY,
