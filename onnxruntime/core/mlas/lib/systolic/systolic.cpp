@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdexcept>
+#include "core/common/replay_profile.h"
 
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wunused-variable"
@@ -130,8 +131,8 @@ void tiled_matmul_auto(size_t dim_I, size_t dim_J, size_t dim_K,
 void SystolicMultiply(char accelerator_mode, bool relu, int dimI, int dimJ, int dimK,
                       const elem_t* in1, const elem_t* in2, elem_t* out, acc_scale_t real_multiplier, const acc_t* bias) {
 #ifndef FOR_FIRESIM
-  printf("Called into systolic matmul!\n");
-  printf("Using accelerated matmul with dimensions (%d, %d, %d)\n", dimI, dimJ, dimK);
+  if (!ort_replay::Enabled("total")) printf("Called into systolic matmul!\n");
+  if (!ort_replay::Enabled("total")) printf("Using accelerated matmul with dimensions (%d, %d, %d)\n", dimI, dimJ, dimK);
 #endif
   tiled_matmul_auto(dimI, dimJ, dimK, in1, in2, bias, out, /*activation= */ relu,
                     real_multiplier,
@@ -156,8 +157,8 @@ void SystolicGemm(char accelerator_mode,
                   acc_scale_t beta,
                   elem_t* C) {
 #ifndef FOR_FIRESIM
-  printf("Called into systolic gemm!\n");
-  printf("Using accelerated gemm with dimensions (%zd, %zd, %zd)\n", M, N, K);
+  if (!ort_replay::Enabled("total")) printf("Called into systolic gemm!\n");
+  if (!ort_replay::Enabled("total")) printf("Using accelerated gemm with dimensions (%zd, %zd, %zd)\n", M, N, K);
 #endif
 
   tiled_gemm_auto(M, N, K, A, B, beta == 0 ? nullptr : C, C, /*activation= */ false,
@@ -180,8 +181,8 @@ void SystolicGemm(char accelerator_mode,
                   elem_t* C,
                   int ldc) {
 #ifndef FOR_FIRESIM
-  printf("Called into systolic gemm!\n");
-  printf("Using accelerated gemm with dimensions (%zd, %zd, %zd)\n", M, N, K);
+  if (!ort_replay::Enabled("total")) printf("Called into systolic gemm!\n");
+  if (!ort_replay::Enabled("total")) printf("Using accelerated gemm with dimensions (%zd, %zd, %zd)\n", M, N, K);
 #endif
   tiled_gemm_auto(M, N, K,
                  lda, ldb, ldc, ldc,
@@ -202,8 +203,8 @@ void SystolicMultiply(char accelerator_mode, bool relu,
                       acc_scale_t real_multiplier,
                       const acc_t* bias, int strideBias, bool repeating_bias) {
 #ifndef FOR_FIRESIM
-  printf("Called into systolic matmul!\n");
-  printf("Using accelerated matmul with dimensions (%d, %d, %d)\n", dimI, dimJ, dimK);
+  if (!ort_replay::Enabled("total")) printf("Called into systolic matmul!\n");
+  if (!ort_replay::Enabled("total")) printf("Using accelerated matmul with dimensions (%d, %d, %d)\n", dimI, dimJ, dimK);
 #endif
   tiled_matmul_auto(dimI, dimJ, dimK,
                     strideIn1, strideIn2, strideBias, strideOut,
@@ -220,7 +221,7 @@ void SystolicAdd(char accelerator_mode __attribute__((unused)), bool relu, const
                  float B_scale,
                  elem_t* C, float C_scale, int dim) {
 #ifndef FOR_FIRESIM
-  printf("Called into systolic add\n");
+  if (!ort_replay::Enabled("total")) printf("Called into systolic add\n");
 #endif
   // To most efficiently use systolic, instead of using 1xdim, we use 16xResizedDim.
   // Systolic can load multiple blocks in a given row
@@ -244,7 +245,7 @@ void SystolicAdd(char accelerator_mode __attribute__((unused)), bool relu, const
                     /*C_scale= */ 1, A, B, C, relu, get_accelerator_mode(accelerator_mode));
   if (dim % DIM > 0) {
 #ifndef FOR_FIRESIM
-    printf("Some extra leftover\n");
+    if (!ort_replay::Enabled("total")) printf("Some extra leftover\n");
 #endif
     tiled_resadd_auto(1, dim % DIM, A_scale / C_scale, B_scale / C_scale,
                       /*C_scale= */ 1, A + resizedDim, B + resizedDim, C + resizedDim, relu, get_accelerator_mode(accelerator_mode));
@@ -264,9 +265,9 @@ void SystolicConv(char accelerator_mode, int batch_size, int in_dim, int in_chan
                   bool relu,
                   float output_scale,
                   int pool_size = 0, int pool_stride = 0, int pool_padding = 0) {
-  printf("Called into systolic conv\n");
+  if (!ort_replay::Enabled("total")) printf("Called into systolic conv\n");
   if (pool_size != 0) {
-    printf("Using systolic pooling\n");
+    if (!ort_replay::Enabled("total")) printf("Using systolic pooling\n");
   }
   // printf("Debugging info\n");
   // printf("Batch size, in_w/h, in_channel %d %d %d\n", batch_size, in_dim, in_channels);
@@ -309,7 +310,7 @@ void SystolicConvTranspose(char accelerator_mode, int batch_size, int in_dim, in
                   elem_t* output,
                   bool relu,
                   float output_scale) {
-  printf("Called into systolic conv transpose\n");
+  if (!ort_replay::Enabled("total")) printf("Called into systolic conv transpose\n");
 
 
   tiled_conv_auto(batch_size, in_dim, in_channels, out_channels, out_dim,
@@ -342,7 +343,7 @@ void SystolicConvBackpropFilter(char accelerator_mode, int batch_size, int in_di
                   elem_t* output,
                   bool relu,
                   float output_scale) {
-  printf("Called into systolic conv backprop filter\n");
+  if (!ort_replay::Enabled("total")) printf("Called into systolic conv backprop filter\n");
 
 
   tiled_conv_auto(batch_size, in_dim, in_channels, out_channels, out_dim,

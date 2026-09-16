@@ -8,6 +8,7 @@
 #include <vector>
 #include <sstream>
 #include "core/common/common.h"
+#include "core/common/replay_profile.h"
 #include "core/common/logging/logging.h"
 #include "core/framework/allocation_planner.h"
 #include "core/framework/execution_frame.h"
@@ -297,6 +298,22 @@ Status SequentialExecutor::Execute(const SessionState& session_state, const std:
 
     Status compute_status;
     {
+      // Only the standalone replay runner supplies these optional callbacks.
+      // Capture actual tensor shapes (including graph-inserted layout nodes).
+      std::string replay_shapes;
+      if (ort_replay::Enabled("node")) {
+        std::ostringstream shapes;
+        shapes << "node_index=" << node_index << ";inputs=";
+        for (int i = 0; i < op_kernel_context.InputCount(); ++i) {
+          const auto* value = op_kernel_context.GetInputMLValue(i);
+          if (i) shapes << '|';
+          if (value && value->IsTensor()) shapes << value->Get<Tensor>().Shape().ToString();
+          else shapes << "non_tensor_or_missing";
+        }
+        replay_shapes = shapes.str();
+      }
+      ort_replay::Scope replay_node("node", node.Name().c_str(),
+                                    node.OpType().c_str(), node.GetExecutionProviderType().c_str());
 #ifdef CONCURRENCY_VISUALIZER
       diagnostic::span span(series, "%s.%d", node.OpType().c_str(), node.Index());
 #endif
@@ -319,6 +336,19 @@ Status SequentialExecutor::Execute(const SessionState& session_state, const std:
           compute_status = ORT_MAKE_STATUS(ONNXRUNTIME, RUNTIME_EXCEPTION, ex.what());
         });
       }
+
+      if (replay_node.Active()) {
+        std::ostringstream shapes;
+        shapes << replay_shapes << ";outputs=";
+        for (int i = 0; i < op_kernel_context.OutputCount(); ++i) {
+          const auto* value = op_kernel_context.GetOutputMLValue(i);
+          if (i) shapes << '|';
+          if (value && value->IsTensor()) shapes << value->Get<Tensor>().Shape().ToString();
+          else shapes << "non_tensor_or_missing";
+        }
+        replay_node.Detail(shapes.str().c_str());
+      }
+      replay_node.End();
 
 #ifdef ENABLE_NVTX_PROFILE
       node_compute_range.End();

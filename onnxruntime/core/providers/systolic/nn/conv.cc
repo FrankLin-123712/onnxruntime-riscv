@@ -43,6 +43,7 @@ ONNX_OPERATOR_VERSIONED_KERNEL_EX(
 
 template <typename T>
 Status Conv_nhwc<T>::Compute(OpKernelContext* context) const {
+  ort_replay::Scope replay_prepare("kernel", "conv.prepare");
   profiling::Profiler& profiler = static_cast<OpKernelContextInternal*>(context)->GetProfiler();
   bool profiling_enabled = profiler.IsEnabled();
 
@@ -89,8 +90,10 @@ Status Conv_nhwc<T>::Compute(OpKernelContext* context) const {
   auto Y_dims_shape = TensorShape(Y_dims);
 
   Tensor* Y = context->Output(0, Y_dims_shape);
+  replay_prepare.End();
 
   // If we can run on Systolic, do so!
+  ort_replay::Scope replay_dispatch("kernel", "conv.dispatch");
   if (TryConvOnSystolic<float, float>(
           static_cast<const SystolicExecutionProvider*>(this->Info().GetExecutionProvider())->GetAcceleratorMode(),
           dilations,
@@ -99,8 +102,15 @@ Status Conv_nhwc<T>::Compute(OpKernelContext* context) const {
           fused_relu_, /*pool_attrs= */ nullptr, /*real_multiplier=*/ 1)) {
     return Status::OK();
   }
+  if (replay_dispatch.Active()) {
+    replay_dispatch.Detail(X->Shape()[1] != X->Shape()[2]
+        ? "path=im2col_matmul;direct_rejected=non_square_input;layout=NHWC"
+        : "path=im2col_matmul;direct_rejected=unsupported_attributes;layout=NHWC");
+  }
+  replay_dispatch.End();
 
   // Else we run on CPU, and have to allocate temp buffer for pre-pooling if needed
+  ort_replay::Scope replay_allocate("kernel", "conv.allocate_im2col");
   AllocatorPtr alloc;
   ORT_RETURN_IF_ERROR(context->GetTempSpaceAllocator(&alloc));
 
@@ -129,7 +139,7 @@ Status Conv_nhwc<T>::Compute(OpKernelContext* context) const {
     col_buffer = BufferUniquePtr(col_data, BufferDeleter(alloc));
   } else {
 #ifndef FOR_FIRESIM
-    printf("1x1 case!\n");
+    if (!ort_replay::Enabled("total")) printf("1x1 case!\n");
 #endif
   }
 
@@ -139,6 +149,7 @@ Status Conv_nhwc<T>::Compute(OpKernelContext* context) const {
   const auto* Wdata = W->template Data<float>();
   const auto* Bdata = B != nullptr ? B->template Data<float>() : nullptr;
   auto* Ydata = Y->template MutableData<float>();
+  replay_allocate.End();
 
   for (int image_id = 0; image_id < N; ++image_id) {
     TimePoint start_time;
@@ -151,6 +162,7 @@ Status Conv_nhwc<T>::Compute(OpKernelContext* context) const {
     // IF one were to parallelize across multiple cores, you could use that
     // Refer to the CPU QLinearConv impl. to see how that works
     if (col_buffer_data != nullptr) {
+      ort_replay::Scope replay_im2col("kernel", "conv.im2col");
       Im2Col_NHWC(
           Xdata,
           C,
@@ -169,6 +181,7 @@ Status Conv_nhwc<T>::Compute(OpKernelContext* context) const {
           col_buffer_data,
           conv_attrs_.group,
           (float) 0.0);
+      replay_im2col.End();
 
       if (profiling_enabled) {
         profiler.EndTimeAndRecordEvent(profiling::NODE_EVENT,
@@ -183,6 +196,11 @@ Status Conv_nhwc<T>::Compute(OpKernelContext* context) const {
 
     for (int group_id = 0; group_id < conv_attrs_.group; ++group_id) {
       const float* weight_base = Wdata + group_id * static_cast<int>(M / conv_attrs_.group);
+      ort_replay::Scope replay_matmul("kernel", "conv.matmul");
+      if (replay_matmul.Active()) {
+        replay_matmul.Detail(("layout=NHWC;M=" + std::to_string(output_image_size) +
+            ";N=" + std::to_string(M / conv_attrs_.group) + ";K=" + std::to_string(kernel_dim)).c_str());
+      }
       SystolicMultiply(static_cast<const SystolicExecutionProvider*>(this->Info().GetExecutionProvider())->GetAcceleratorMode(),
                        /*relu= */ fused_relu_,
                        static_cast<int>(output_image_size),
@@ -194,6 +212,7 @@ Status Conv_nhwc<T>::Compute(OpKernelContext* context) const {
                        /*multiplier= */ (float) 1.0,
                        Bdata != nullptr ? Bdata + group_id * B_offset : nullptr, static_cast<int>(M / conv_attrs_.group),
                        /*repeating_bias= */ true);
+      replay_matmul.End();
 
       if (profiling_enabled) {
         std::string dimension_string;
@@ -221,6 +240,7 @@ Status Conv_nhwc<T>::Compute(OpKernelContext* context) const {
 
 template <typename T>
 Status Conv<T>::Compute(OpKernelContext* context) const {
+  ort_replay::Scope replay_prepare("kernel", "conv.prepare");
   const auto* X = context->Input<Tensor>(0);
   const auto* W = context->Input<Tensor>(1);
   const Tensor* B = context->Input<Tensor>(2);  // optional. nullptr if not provided
@@ -291,10 +311,13 @@ Status Conv<T>::Compute(OpKernelContext* context) const {
 
   const T* Xdata = X->template Data<T>();
   T* Ydata = Y->template MutableData<T>();
+  if (replay_prepare.Active()) replay_prepare.Detail("path=im2col_matmul;layout=NCHW");
+  replay_prepare.End();
 
   for (int image_id = 0; image_id < N; ++image_id) {
     for (int group_id = 0; group_id < conv_attrs_.group; ++group_id) {
       if (col_buffer_data != nullptr) {
+        ort_replay::Scope replay_im2col("kernel", "conv.im2col");
         if (kernel_rank == 2) {
           math::Im2col<T, StorageOrder::NCHW>()(
               Xdata + group_id * X_offset,
@@ -327,6 +350,11 @@ Status Conv<T>::Compute(OpKernelContext* context) const {
         }
       }
 
+      ort_replay::Scope replay_matmul("kernel", "conv.matmul");
+      if (replay_matmul.Active()) {
+        replay_matmul.Detail(("layout=NCHW;M=" + std::to_string(M / conv_attrs_.group) +
+            ";N=" + std::to_string(output_image_size) + ";K=" + std::to_string(kernel_dim)).c_str());
+      }
       SystolicMultiply(static_cast<const SystolicExecutionProvider*>(
                         this->Info().GetExecutionProvider())->GetAcceleratorMode(),
                       /* relu= */ false,
@@ -337,9 +365,11 @@ Status Conv<T>::Compute(OpKernelContext* context) const {
                       col_buffer_data == nullptr ? Xdata + group_id * X_offset : col_buffer_data,
                       Ydata + group_id * Y_offset,
                       /*real_multiplier=*/ 1, /* bias= */nullptr);
+      replay_matmul.End();
     }
 
     if (B != nullptr) {
+      ort_replay::Scope replay_bias("kernel", "conv.bias");
       auto Ymatrix = EigenMatrixMap<T>(Ydata, output_image_size, M);
       auto Bvec = ConstEigenVectorMap<T>(B->template Data<T>(), M);
       Ymatrix.rowwise() += Bvec.transpose();

@@ -4,6 +4,7 @@
 #include "core/common/exceptions.h"
 #include "core/providers/common.h"
 #include "core/common/common.h"
+#include "core/common/replay_profile.h"
 
 namespace onnxruntime {
 namespace systolic {
@@ -108,6 +109,8 @@ inline bool TryConvOnSystolic(char accelerator_mode,
   int input_channels = X->Shape()[3];
   int output_channels = W->Shape()[3];
 
+  ort_replay::Scope replay_conv("kernel", "conv.direct", "Conv", "SystolicExecutionProvider");
+  if (replay_conv.Active()) replay_conv.Detail("path=direct_conv;layout=NHWC");
   SystolicConv(accelerator_mode,
                batch_size,
                input_dim,
