@@ -103,9 +103,7 @@ Status Conv_nhwc<T>::Compute(OpKernelContext* context) const {
     return Status::OK();
   }
   if (replay_dispatch.Active()) {
-    replay_dispatch.Detail(X->Shape()[1] != X->Shape()[2]
-        ? "path=im2col_matmul;direct_rejected=non_square_input;layout=NHWC"
-        : "path=im2col_matmul;direct_rejected=unsupported_attributes;layout=NHWC");
+    replay_dispatch.Detail("path=im2col_matmul;direct_rejected=unsupported_mode_attributes_or_capacity;layout=NHWC");
   }
   replay_dispatch.End();
 

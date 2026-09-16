@@ -40,6 +40,15 @@ MLASCALL(char accelerator_mode, int batch_size, int in_dim, int in_channels,
 
 #ifdef SYSTOLIC_FP32
 
+// NHWC/HWIO rectangular WS convolution; false means no instructions issued.
+bool SystolicConvRect(char accelerator_mode, int64_t batch,
+                     int64_t input_h, int64_t input_w, int64_t input_channels,
+                     int64_t output_channels, int64_t output_h, int64_t output_w,
+                     int64_t stride, int64_t padding, int64_t kernel,
+                     const float* input, const float* weights, const float* bias,
+                     float* output, bool relu, float output_scale);
+
+
 void SystolicMultiply
 MLASCALL(char accelerator_mode, bool relu, int dimI, int dimJ, int dimK, const float* in1, const float* in2,
          float* out, float real_multiplier, const float* bias = nullptr);

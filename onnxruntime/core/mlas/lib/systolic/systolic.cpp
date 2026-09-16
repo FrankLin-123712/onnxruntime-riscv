@@ -14,6 +14,44 @@
 #include "systolic_include.h"
 #pragma GCC diagnostic pop
 
+#ifdef SYSTOLIC_FP32
+#include "conv_rect.h"
+
+// NHWC/HWIO rectangular WS convolution; false means no instructions issued.
+bool SystolicConvRect(char accelerator_mode, int64_t batch,
+                     int64_t input_h, int64_t input_w, int64_t input_channels,
+                     int64_t output_channels, int64_t output_h, int64_t output_w,
+                     int64_t stride, int64_t padding, int64_t kernel,
+                     const float* input, const float* weights, const float* bias,
+                     float* output, bool relu, float output_scale) {
+  const systolic_rect::Shape s{batch, input_h, input_w, input_channels,
+      output_channels, output_h, output_w, kernel, stride, padding};
+  if (accelerator_mode != 2 || !input || !weights || !output ||
+      !systolic_rect::Supported(s)) return false;
+  const auto tile = systolic_rect::SelectTile(s, DIM, BANK_NUM * BANK_ROWS, ACC_ROWS);
+  if (!tile.rows) return false;
+  ort_replay::Scope profile("kernel", "conv.direct", "Conv", "SystolicExecutionProvider");
+  if (profile.Active()) profile.Detail("path=direct_conv;layout=NHWC;abi=rect_v1;tiling=fixed_v1");
+  gemmini_extended_config_st(output_channels * sizeof(float), relu, output_scale);
+  // Explicitly disable the separate HW Im2Col unit, even after a prior user.
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY,
+      0, 1, stride, false, false, 0, 0, 0, 0, 0, 0, 0, 0, 0, false);
+  systolic_rect::Run(s, tile, input, weights, bias, output, relu,
+      [](int funct, uint64_t rs1, uint64_t rs2) {
+        // RoCC funct is an assembler immediate; retain literal cases.
+#define RECT_EMIT(f) case f: ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, rs1, rs2, f); break
+        switch (funct) {
+          RECT_EMIT(16); RECT_EMIT(17); RECT_EMIT(18); RECT_EMIT(19);
+          RECT_EMIT(20); RECT_EMIT(21); RECT_EMIT(15);
+        }
+#undef RECT_EMIT
+      });
+  gemmini_fence();
+  return true;
+}
+#endif
+
+
 /**
  * Perform a matmul and subsequent quantization.
  * Switch between TILED_OS and TILED_CPU

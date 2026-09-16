@@ -35,6 +35,24 @@ inline bool TryConvOnSystolic(char accelerator_mode,
                               bool relu,
                               const PoolAttributes *pool_attrs_,
                               float output_scale) {
+#ifdef SYSTOLIC_FP32
+  // Square and rectangular feature maps share the rectangular LoopConv ABI.
+  // Unsupported modes/attributes retain the im2col+matmul fallback.
+  if (accelerator_mode != 2 || groups != 1 ||
+      (pool_attrs_ && pool_attrs_->fused_pool) ||
+      X->Shape().NumDimensions() != 4 || W->Shape().NumDimensions() != 4 ||
+      Y_dims_prepool.NumDimensions() != 4 ||
+      strides.size() != 2 || pads.size() != 4 || dilations.size() != 2 ||
+      W->Shape()[0] != W->Shape()[1] ||
+      dilations[0] != 1 || dilations[1] != 1 || strides[0] != strides[1] ||
+      std::any_of(pads.begin(), pads.end(), [&](int64_t p) { return p != pads[0]; }))
+    return false;
+  return SystolicConvRect(accelerator_mode, X->Shape()[0], X->Shape()[1], X->Shape()[2],
+      X->Shape()[3], W->Shape()[3], Y_dims_prepool[1], Y_dims_prepool[2],
+      strides[0], pads[0], W->Shape()[0], X->template Data<float>(),
+      W->template Data<float>(), B ? B->template Data<float>() : nullptr,
+      output->template MutableData<float>(), relu, output_scale);
+#else
   if (groups != 1) {
     return false;
   }
@@ -132,6 +150,7 @@ inline bool TryConvOnSystolic(char accelerator_mode,
 
   //printf("First few output data %d %d %d %d\n", Ydata[0], Ydata[1], Ydata[2], Ydata[3]);
   return true;
+#endif
 }
 
 
