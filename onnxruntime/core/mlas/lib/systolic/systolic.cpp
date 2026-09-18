@@ -168,12 +168,30 @@ void tiled_matmul_auto(size_t dim_I, size_t dim_J, size_t dim_K,
 
 /* End internal */
 
+// Logical dimensions and DIM padding describe work shape, not measured PE utilization.
+static void ProfileMatmulShape(ort_replay::Scope& profile, size_t m, size_t n,
+                               size_t k, char mode, bool trans_a, bool trans_b) {
+  if (!profile.Active()) return;
+  const auto pad = [](size_t v) { return ((v + DIM - 1) / DIM) * DIM; };
+  const std::string detail = "M=" + std::to_string(m) + ";N=" + std::to_string(n) +
+      ";K=" + std::to_string(k) + ";execution=" + std::to_string(int(mode)) +
+      ";DIM=" + std::to_string(DIM) + ";padded_M=" + std::to_string(pad(m)) +
+      ";padded_N=" + std::to_string(pad(n)) + ";padded_K=" + std::to_string(pad(k)) +
+      ";transA=" + std::to_string(trans_a) + ";transB=" + std::to_string(trans_b) +
+      ";tiling=auto;ops=" + std::to_string(2.0 * m * n * k);
+  profile.Detail(detail.c_str());
+}
+
+
+
 /**
  * An interface similar to Gemmlowp's matrix multiply
  * Does real_multiplier*(in1 * in2 + bias)
  */
 void SystolicMultiply(char accelerator_mode, bool relu, int dimI, int dimJ, int dimK,
                       const elem_t* in1, const elem_t* in2, elem_t* out, acc_scale_t real_multiplier, const acc_t* bias) {
+  ort_replay::Scope profile("kernel", "matmul", "MatMul", "SystolicExecutionProvider");
+  ProfileMatmulShape(profile, dimI, dimJ, dimK, accelerator_mode, false, false);
 #ifndef FOR_FIRESIM
   if (!ort_replay::Enabled("total")) printf("Called into systolic matmul!\n");
   if (!ort_replay::Enabled("total")) printf("Using accelerated matmul with dimensions (%d, %d, %d)\n", dimI, dimJ, dimK);
@@ -200,6 +218,8 @@ void SystolicGemm(char accelerator_mode,
                   const elem_t* B,
                   acc_scale_t beta,
                   elem_t* C) {
+  ort_replay::Scope profile("kernel", "gemm", "Gemm", "SystolicExecutionProvider");
+  ProfileMatmulShape(profile, M, N, K, accelerator_mode, TransA, TransB);
 #ifndef FOR_FIRESIM
   if (!ort_replay::Enabled("total")) printf("Called into systolic gemm!\n");
   if (!ort_replay::Enabled("total")) printf("Using accelerated gemm with dimensions (%zd, %zd, %zd)\n", M, N, K);
@@ -224,6 +244,8 @@ void SystolicGemm(char accelerator_mode,
                   acc_scale_t beta,
                   elem_t* C,
                   int ldc) {
+  ort_replay::Scope profile("kernel", "gemm", "Gemm", "SystolicExecutionProvider");
+  ProfileMatmulShape(profile, M, N, K, accelerator_mode, TransA, TransB);
 #ifndef FOR_FIRESIM
   if (!ort_replay::Enabled("total")) printf("Called into systolic gemm!\n");
   if (!ort_replay::Enabled("total")) printf("Using accelerated gemm with dimensions (%zd, %zd, %zd)\n", M, N, K);
@@ -246,6 +268,8 @@ void SystolicMultiply(char accelerator_mode, bool relu,
                       elem_t* out, int strideOut,
                       acc_scale_t real_multiplier,
                       const acc_t* bias, int strideBias, bool repeating_bias) {
+  ort_replay::Scope profile("kernel", "matmul", "MatMul", "SystolicExecutionProvider");
+  ProfileMatmulShape(profile, dimI, dimJ, dimK, accelerator_mode, false, false);
 #ifndef FOR_FIRESIM
   if (!ort_replay::Enabled("total")) printf("Called into systolic matmul!\n");
   if (!ort_replay::Enabled("total")) printf("Using accelerated matmul with dimensions (%d, %d, %d)\n", dimI, dimJ, dimK);
