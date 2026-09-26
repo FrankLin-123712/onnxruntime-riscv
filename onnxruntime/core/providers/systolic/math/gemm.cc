@@ -11,6 +11,11 @@
 #include "core/providers/systolic/helper/helper.h"
 #include "core/providers/cpu/math/gemm_helper.h"
 
+#ifdef SYSTOLIC_FP16
+#include "core/mlas/inc/systolic_mlas.h"
+#include "core/mlas/inc/systolic_fp16.h"
+#endif
+
 #ifdef SYSTOLIC_FP32
 
 namespace onnxruntime {
@@ -114,3 +119,57 @@ Status Gemm<float>::Compute(OpKernelContext* context) const {
 }  // namespace onnxruntime
 
 #endif
+
+#ifdef SYSTOLIC_FP16
+
+namespace onnxruntime {
+namespace systolic {
+
+class HalfGemm final : public OpKernel {
+ public:
+  explicit HalfGemm(const OpKernelInfo& info) : OpKernel(info), mode_(Mode(info)) {
+    int64_t ta=0,tb=0;
+    info.GetAttrOrDefault("transA", &ta, int64_t(0));
+    info.GetAttrOrDefault("transB", &tb, int64_t(0));
+    ta_=ta!=0; tb_=tb!=0;
+    info.GetAttrOrDefault("alpha", &alpha_, 1.0f);
+    info.GetAttrOrDefault("beta", &beta_, 1.0f);
+  }
+  Status Compute(OpKernelContext* ctx) const override {
+    const auto* a=ctx->Input<Tensor>(0); const auto* b=ctx->Input<Tensor>(1);
+    const auto* d=ctx->Input<Tensor>(2);
+    GemmHelper h(a->Shape(),ta_,b->Shape(),tb_,d ? d->Shape() : TensorShape({}));
+    ORT_RETURN_IF_ERROR(h.State());
+    const size_t m=h.M(), n=h.N(), k=h.K();
+    auto* y=ctx->Output(0,{h.M(),h.N()});
+    if (!m || !n) return Status::OK();
+    auto av=HalfBits(*a), bv=HalfBits(*b);
+    std::vector<uint16_t> ap(m*k),bp(k*n),out(m*n);
+    for(size_t i=0;i<m;++i) for(size_t t=0;t<k;++t) ap[i*k+t]=av[ta_ ? t*m+i : i*k+t];
+    for(size_t t=0;t<k;++t) for(size_t j=0;j<n;++j) bp[t*n+j]=bv[tb_ ? j*k+t : t*n+j];
+    std::vector<float> sums(m*n,0.0f);
+    if (alpha_ != 0.0f)
+      SystolicHalfMatmul(mode_,m,n,k,ap.data(),k,bp.data(),n,nullptr,n,nullptr,n,false,false,1.0f,sums.data());
+    for(size_t i=0;i<m;++i) for(size_t j=0;j<n;++j) {
+      float bias=0;
+      if (d && beta_ != 0.0f) {
+        const auto& ds=d->Shape();
+        const size_t row=ds.NumDimensions()==2 && ds[0]!=1 ? i : 0;
+        const size_t width=ds.NumDimensions() ? size_t(ds.GetDims().back()) : 1;
+        const size_t col=width==1 ? 0 : j;
+        bias=static_cast<float>(systolic_fp16::FromBits(d->Data<MLFloat16>()[row*width+col].val));
+      }
+      out[i*n+j]=systolic_fp16::ToBits(static_cast<_Float16>(alpha_*sums[i*n+j]+beta_*bias));
+    }
+    SetHalf(*y,out); return Status::OK();
+  }
+ private: char mode_; bool ta_,tb_; float alpha_,beta_;
+};
+
+ONNX_OPERATOR_VERSIONED_TYPED_KERNEL_EX(Gemm,kOnnxDomain,7,13,MLFloat16,kSystolicExecutionProvider,
+    KernelDefBuilder().TypeConstraint("T",DataTypeImpl::GetTensorType<MLFloat16>()),HalfGemm);
+
+}  // namespace systolic
+}  // namespace onnxruntime
+
+#endif  // SYSTOLIC_FP16

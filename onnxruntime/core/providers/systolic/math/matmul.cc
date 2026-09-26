@@ -8,6 +8,10 @@
 #include "core/providers/systolic/systolic_execution_provider.h"
 #include "core/providers/systolic/helper/helper.h"
 
+#ifdef SYSTOLIC_FP16
+#include "core/mlas/inc/systolic_mlas.h"
+#endif
+
 #ifdef SYSTOLIC_FP32
 
 namespace onnxruntime {
@@ -72,3 +76,40 @@ Status MatMul<T>::Compute(OpKernelContext* ctx) const {
 }  // namespace onnxruntime
 
 #endif
+
+#ifdef SYSTOLIC_FP16
+
+namespace onnxruntime {
+namespace systolic {
+
+class HalfMatMul final : public OpKernel {
+ public:
+  explicit HalfMatMul(const OpKernelInfo& info) : OpKernel(info), mode_(Mode(info)) {}
+  Status Compute(OpKernelContext* ctx) const override {
+    const auto* a = ctx->Input<Tensor>(0); const auto* b = ctx->Input<Tensor>(1);
+    MatMulComputeHelper h;
+    ORT_RETURN_IF_ERROR(h.Compute(a->Shape(), b->Shape()));
+    auto* y = ctx->Output(0, h.OutputShape());
+    if (!y->Shape().Size()) return Status::OK();
+    auto av = HalfBits(*a), bv = HalfBits(*b);
+    std::vector<uint16_t> out(static_cast<size_t>(y->Shape().Size()));
+    for (size_t i=0; i<h.OutputOffsets().size(); ++i)
+      SystolicHalfMatmul(mode_, h.M(), h.N(), h.K(),
+          av.empty() ? nullptr : av.data()+h.LeftOffsets()[i], h.K(),
+          bv.empty() ? nullptr : bv.data()+h.RightOffsets()[i], h.N(),
+          nullptr, h.N(), out.data()+h.OutputOffsets()[i], h.N());
+    SetHalf(*y, out);
+    return Status::OK();
+  }
+ private: char mode_;
+};
+
+ONNX_OPERATOR_TYPED_KERNEL_EX(MatMul,kOnnxDomain,9,MLFloat16,kSystolicExecutionProvider,
+    KernelDefBuilder().TypeConstraint("T",DataTypeImpl::GetTensorType<MLFloat16>()),HalfMatMul);
+ONNX_OPERATOR_VERSIONED_TYPED_KERNEL_EX(MatMul,kOnnxDomain,1,8,MLFloat16,kSystolicExecutionProvider,
+    KernelDefBuilder().TypeConstraint("T",DataTypeImpl::GetTensorType<MLFloat16>()),HalfMatMul);
+
+}  // namespace systolic
+}  // namespace onnxruntime
+
+#endif  // SYSTOLIC_FP16

@@ -89,9 +89,9 @@ inline Tile SelectTile(const Shape& s, int dim, int sp_rows, int acc_rows) {
 
 // emit(funct, rs1, rs2): one custom instruction, all operands in element units
 // except the four host addresses. No input/weight residency reuse is assumed.
-template <class Emit>
-inline void Run(const Shape& s, const Tile& t, const float* input,
-                const float* weights, const float* bias, float* output,
+template <class Element, class Bias, class Emit>
+inline void Run(const Shape& s, const Tile& t, const Element* input,
+                const Element* weights, const Bias* bias, Element* output,
                 bool relu, Emit emit) {
   auto u = [](int64_t x) { return static_cast<uint64_t>(x); };
   auto address = [](const void* p) { return uint64_t(reinterpret_cast<uintptr_t>(p)); };
@@ -112,8 +112,8 @@ inline void Run(const Shape& s, const Tile& t, const float* input,
             const int64_t left = std::max<int64_t>(0, -ix);
             const int64_t bottom = std::max<int64_t>(0, iy + ir - s.ih);
             const int64_t right = std::max<int64_t>(0, ix + iw - s.iw);
-            const float* a = input + ((n * s.ih + iy + top) * s.iw + ix + left) * s.ci + ic;
-            const float* b = weights + ic * s.co + oc;
+            const Element* a = input + ((n * s.ih + iy + top) * s.iw + ix + left) * s.ci + ic;
+            const Element* b = weights + ic * s.co + oc;
             // Nonzero D initializes the accumulator. With no_bias=1 the RTL
             // synthesizes zeros rather than dereferencing the sentinel.
             const uint64_t d = ic ? 0 : (bias ? address(bias + oc) : 1);

@@ -1,3 +1,134 @@
+#ifdef SYSTOLIC_FP16
+// FP16 implementation shared by ORT and standalone replay binaries.
+#include "core/mlas/inc/systolic_mlas.h"
+#include "core/mlas/inc/systolic_fp16.h"
+#include "core/common/replay_profile.h"
+#include <algorithm>
+#include <cmath>
+#include <limits>
+#include <stdexcept>
+#include <string>
+#include "conv_rect.h"
+
+#ifdef __riscv
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-function"
+#pragma GCC diagnostic ignored "-Wunused-variable"
+#pragma GCC diagnostic ignored "-Wunused-parameter"
+#pragma GCC diagnostic ignored "-Wsign-compare"
+#include "systolic_include.h"
+#pragma GCC diagnostic pop
+static_assert(DIM == 32 && sizeof(elem_t) == 2 && sizeof(acc_t) == 4,
+              "FP16 kernels require DPVO FP16 DIM32 ABI");
+#endif
+
+namespace {
+uint16_t HalfFma(uint16_t a, uint16_t b, uint16_t c) {
+  // Preserve the numerical reference: fused double arithmetic followed by a
+  // direct double-to-half conversion, never an intermediate float rounding.
+  const double value = std::fma(static_cast<double>(systolic_fp16::FromBits(a)),
+                                static_cast<double>(systolic_fp16::FromBits(b)),
+                                static_cast<double>(systolic_fp16::FromBits(c)));
+  return systolic_fp16::ToBits(static_cast<_Float16>(value));
+}
+
+void CheckHalfMode(char mode) {
+  systolic_fp16::RequireRoundToNearest();
+  if (mode != 0 && mode != 2)
+    throw std::invalid_argument("FP16 Gemmini supports CPU mode 0 or WS mode 2 only");
+#ifndef __riscv
+  if (mode != 0) throw std::invalid_argument("Gemmini WS requires RISC-V hardware");
+#endif
+}
+}
+
+void SystolicHalfMatmul(char mode, size_t m, size_t n, size_t k,
+                       const uint16_t* a, size_t lda,
+                       const uint16_t* b, size_t ldb,
+                       const float* d, size_t ldd,
+                       uint16_t* c, size_t ldc,
+                       bool repeating_bias, bool relu, float output_scale,
+                       float* full_output) {
+  CheckHalfMode(mode);
+  if (m == 0 || n == 0) return;
+  if ((!c && !full_output) || ldc < n || (k && (!a || !b || lda < k || ldb < n)) || (d && ldd < n))
+    throw std::invalid_argument("Invalid FP16 matmul buffers/strides");
+  if (full_output && (relu || output_scale != 1.0f))
+    throw std::invalid_argument("Full accumulator read does not apply activation/scaling");
+  ort_replay::Scope profile("kernel", "matmul.fp16", "MatMul", "SystolicExecutionProvider");
+  if (profile.Active()) {
+    profile.Detail(("dtype=fp16;pe_acc=fp16;acc=fp32;DIM=32;execution=" +
+        std::to_string(int(mode)) + ";M=" + std::to_string(m) +
+        ";N=" + std::to_string(n) + ";K=" + std::to_string(k)).c_str());
+  }
+#ifdef __riscv
+  if (mode == 2 && k) {
+    tiled_matmul_auto(m, n, k, a, b, d, full_output ? static_cast<void*>(full_output) : c, lda, ldb, ldd, ldc,
+        MVIN_SCALE_IDENTITY, MVIN_SCALE_IDENTITY, MVIN_SCALE_IDENTITY,
+        relu ? RELU : NO_ACTIVATION, output_scale, 0, repeating_bias,
+        false, false, full_output != nullptr, false, 3, WS);
+    return;
+  }
+#endif
+  // Numerical reference: half FMA in groups of DIM, float accumulator between
+  // groups. RTL reduction ordering still needs independent hardware validation.
+  for (size_t i = 0; i < m; ++i) for (size_t j = 0; j < n; ++j) {
+    float sum = d ? d[(repeating_bias ? 0 : i) * ldd + j] : 0.0f;
+    for (size_t kk = 0; kk < k; kk += 32) {
+      uint16_t partial = 0;
+      for (size_t t = kk; t < std::min(k, kk + 32); ++t)
+        partial = HalfFma(a[i * lda + t], b[t * ldb + j], partial);
+      sum += static_cast<float>(systolic_fp16::FromBits(partial));
+    }
+    sum *= output_scale;
+    if (relu && sum < 0) sum = 0;
+    if (full_output) full_output[i * ldc + j] = sum;
+    else c[i * ldc + j] = systolic_fp16::ToBits(static_cast<_Float16>(sum));
+  }
+}
+
+bool SystolicHalfConvRect(char mode, int64_t batch,
+                         int64_t ih, int64_t iw, int64_t ci,
+                         int64_t co, int64_t oh, int64_t ow,
+                         int64_t stride, int64_t pad, int64_t kernel,
+                         const uint16_t* input, const uint16_t* weights,
+                         const float* bias, uint16_t* output, bool relu) {
+  CheckHalfMode(mode);
+  const systolic_rect::Shape s{batch, ih, iw, ci, co, oh, ow, kernel, stride, pad};
+  if (mode != 2 || !input || !weights || !output || !systolic_rect::Supported(s)) return false;
+#if defined(__riscv) && defined(SYSTOLIC_FP16_RECT_SCALE_VERIFIED)
+  // Current LoopConv.scala hardcodes FP32 mvin identity. Only enable after
+  // an independently validated hardware fix and a matching bitstream.
+  const auto tile = systolic_rect::SelectTile(s, DIM, BANK_NUM * BANK_ROWS, ACC_ROWS);
+  if (!tile.rows) return false;
+  ort_replay::Scope profile("kernel", "conv.direct.fp16", "Conv", "SystolicExecutionProvider");
+  if (profile.Active()) profile.Detail("dtype=fp16;pe_acc=fp16;acc=fp32;abi=rect_v1;DIM=32");
+  gemmini_extended_config_st(co * sizeof(elem_t), relu, ACC_SCALE_IDENTITY);
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, 0, 0, ACC_SCALE_IDENTITY,
+      0, 1, stride, false, false, 0, 0, 0, 0, 0, 0, 0, 0, 0, false);
+  systolic_rect::Run(s, tile, input, weights, bias, output, relu,
+      [](int funct, uint64_t rs1, uint64_t rs2) {
+#define HALF_RECT_EMIT(f) case f: ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, rs1, rs2, f); break
+        switch (funct) {
+          HALF_RECT_EMIT(16); HALF_RECT_EMIT(17); HALF_RECT_EMIT(18);
+          HALF_RECT_EMIT(19); HALF_RECT_EMIT(20); HALF_RECT_EMIT(21); HALF_RECT_EMIT(15);
+        }
+#undef HALF_RECT_EMIT
+      });
+  gemmini_fence();
+  return true;
+#else
+  (void)bias; (void)relu;
+  return false;
+#endif
+}
+
+void SystolicFlush() {
+#ifdef __riscv
+  gemmini_flush(0);
+#endif
+}
+#else
 // See LICENSE for license details.
 
 #include <assert.h>
@@ -444,3 +575,5 @@ void cleargemmini() {
   SystolicFlush();
 }
 #endif
+
+#endif  // SYSTOLIC_FP16

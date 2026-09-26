@@ -2,6 +2,32 @@
 #include <iostream>
 #include "core/framework/tensor.h"
 
+#ifdef SYSTOLIC_FP16
+#include <cstring>
+#include <vector>
+#include "core/framework/op_kernel.h"
+#include "core/providers/systolic/systolic_execution_provider.h"
+
+namespace onnxruntime {
+namespace systolic {
+
+// Copy binary16 bits between ORT tensors and the Gemmini API buffers.
+inline std::vector<uint16_t> HalfBits(const Tensor& t) {
+  std::vector<uint16_t> v(static_cast<size_t>(t.Shape().Size()));
+  if (!v.empty()) std::memcpy(v.data(), t.Data<MLFloat16>(), v.size()*sizeof(uint16_t));
+  return v;
+}
+inline void SetHalf(Tensor& t, const std::vector<uint16_t>& v) {
+  if (!v.empty()) std::memcpy(t.MutableData<MLFloat16>(), v.data(), v.size()*sizeof(uint16_t));
+}
+inline char Mode(const OpKernelInfo& info) {
+  return static_cast<const SystolicExecutionProvider*>(info.GetExecutionProvider())->GetAcceleratorMode();
+}
+
+}  // namespace systolic
+}  // namespace onnxruntime
+#endif  // SYSTOLIC_FP16
+
 template <typename T>
 inline void DumpTensor(const onnxruntime::Tensor* tensor) {
   for (int i = 0; i < tensor->Shape().Size(); i++) {

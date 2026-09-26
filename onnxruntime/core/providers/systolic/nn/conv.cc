@@ -12,6 +12,11 @@
 #include "core/common/safeint.h"
 #include "conv_pool_helper.h"
 
+#ifdef SYSTOLIC_FP16
+#include "core/mlas/inc/systolic_mlas.h"
+#include "core/mlas/inc/systolic_fp16.h"
+#endif
+
 #ifdef SYSTOLIC_FP32
 
 namespace onnxruntime {
@@ -384,3 +389,87 @@ Status Conv<T>::Compute(OpKernelContext* context) const {
 }  // namespace onnxruntime
 
 #endif
+
+#ifdef SYSTOLIC_FP16
+
+namespace onnxruntime {
+namespace systolic {
+
+template<bool NHWC>
+class HalfConv final : public OpKernel {
+ public:
+  explicit HalfConv(const OpKernelInfo& info) : OpKernel(info), attrs_(info), mode_(Mode(info)) {}
+  Status Compute(OpKernelContext* ctx) const override {
+    const auto* x=ctx->Input<Tensor>(0); const auto* w=ctx->Input<Tensor>(1);
+    const auto* bias=ctx->Input<Tensor>(2);
+    ORT_ENFORCE(x->Shape().NumDimensions()==4 && w->Shape().NumDimensions()==4,
+                "FP16 systolic Conv currently supports 2D convolution");
+    const auto& xs=x->Shape(); const auto& ws=w->Shape();
+    const int64_t batch=xs[0], ci=xs[NHWC?3:1], ih=xs[NHWC?1:2], iw=xs[NHWC?2:3];
+    const int64_t co=ws[NHWC?3:0], kh=ws[NHWC?0:2], kw=ws[NHWC?1:3];
+    const TensorShape xshape{batch,ci,ih,iw}, wshape{co,ws[NHWC?2:1],kh,kw};
+    ORT_RETURN_IF_ERROR(attrs_.ValidateInputShape(xshape,wshape));
+    ORT_ENFORCE(attrs_.group>0, "Conv group must be positive");
+    ORT_ENFORCE(!bias || (bias->Shape().NumDimensions()==1 && bias->Shape()[0]==co), "Invalid Conv bias");
+    std::vector<int64_t> kernel;
+    ORT_RETURN_IF_ERROR(attrs_.ComputeKernelShape(wshape,kernel));
+    auto strides=attrs_.strides, pads=attrs_.pads, dilations=attrs_.dilations;
+    if(strides.empty()) strides.assign(2,1);
+    if(pads.empty()) pads.assign(4,0);
+    if(dilations.empty()) dilations.assign(2,1);
+    ORT_ENFORCE(strides.size()==2 && dilations.size()==2 && pads.size()==4, "Invalid Conv attributes");
+    std::vector<int64_t> dims{batch,co};
+    ORT_RETURN_IF_ERROR(attrs_.InferOutputShape(TensorShape{ih,iw},kernel,strides,dilations,pads,dims));
+    const int64_t oh=dims[2],ow=dims[3];
+    auto* y=ctx->Output(0,NHWC ? TensorShape{batch,oh,ow,co} : TensorShape(dims));
+    if(!y->Shape().Size()) return Status::OK();
+    auto xv=HalfBits(*x),wv=HalfBits(*w);
+    std::vector<uint16_t> out(static_cast<size_t>(y->Shape().Size()));
+    std::vector<float> bv(size_t(co),0.0f);
+    if(bias) for(int64_t c=0;c<co;++c) bv[c]=static_cast<float>(systolic_fp16::FromBits(bias->Data<MLFloat16>()[c].val));
+    if(NHWC && attrs_.group==1 && kh==kw && strides[0]==strides[1] &&
+       dilations[0]==1 && dilations[1]==1 &&
+       std::all_of(pads.begin(),pads.end(),[&](int64_t p){return p==pads[0];}) &&
+       SystolicHalfConvRect(mode_,batch,ih,iw,ci,co,oh,ow,strides[0],pads[0],kh,
+                           xv.data(),wv.data(),bias?bv.data():nullptr,out.data(),false)) {
+      SetHalf(*y,out); return Status::OK();
+    }
+    // Bounded im2col workspace: at most 32 output pixels per Gemmini call.
+    const int64_t cig=ci/attrs_.group,cog=co/attrs_.group,k=kh*kw*cig;
+    std::vector<uint16_t> a(size_t(32*k)),b(size_t(k*cog)),c(size_t(32*cog));
+    for(int64_t g=0;g<attrs_.group;++g) {
+      for(int64_t ky=0;ky<kh;++ky) for(int64_t kx=0;kx<kw;++kx)
+        for(int64_t ic=0;ic<cig;++ic) for(int64_t oc=0;oc<cog;++oc) {
+          const int64_t t=(ky*kw+kx)*cig+ic;
+          b[t*cog+oc]=wv[NHWC ? ((ky*kw+kx)*cig+ic)*co+g*cog+oc : ((g*cog+oc)*cig+ic)*kh*kw+ky*kw+kx];
+        }
+      for(int64_t ni=0;ni<batch;++ni) for(int64_t p=0;p<oh*ow;p+=32) {
+        const int64_t rows=std::min<int64_t>(32,oh*ow-p);
+        for(int64_t r=0;r<rows;++r) for(int64_t ky=0;ky<kh;++ky) for(int64_t kx=0;kx<kw;++kx)
+          for(int64_t ic=0;ic<cig;++ic) {
+            const int64_t yy=(p+r)/ow*strides[0]-pads[0]+ky*dilations[0];
+            const int64_t xx=(p+r)%ow*strides[1]-pads[1]+kx*dilations[1];
+            const int64_t channel=g*cig+ic,t=(ky*kw+kx)*cig+ic;
+            a[r*k+t]=(yy<0||xx<0||yy>=ih||xx>=iw) ? 0 : xv[NHWC ? ((ni*ih+yy)*iw+xx)*ci+channel : ((ni*ci+channel)*ih+yy)*iw+xx];
+          }
+        SystolicHalfMatmul(mode_,rows,cog,k,a.data(),k,b.data(),cog,bias?bv.data()+g*cog:nullptr,cog,c.data(),cog,true);
+        for(int64_t r=0;r<rows;++r) for(int64_t oc=0;oc<cog;++oc)
+          out[NHWC ? (ni*oh*ow+p+r)*co+g*cog+oc : (ni*co+g*cog+oc)*oh*ow+p+r]=c[r*cog+oc];
+      }
+    }
+    SetHalf(*y,out); return Status::OK();
+  }
+ private: ConvAttributes attrs_; char mode_;
+};
+
+ONNX_OPERATOR_TYPED_KERNEL_EX(Conv,kOnnxDomain,11,MLFloat16,kSystolicExecutionProvider,
+    KernelDefBuilder().TypeConstraint("T",DataTypeImpl::GetTensorType<MLFloat16>()),HalfConv<false>);
+ONNX_OPERATOR_VERSIONED_TYPED_KERNEL_EX(Conv,kOnnxDomain,1,10,MLFloat16,kSystolicExecutionProvider,
+    KernelDefBuilder().TypeConstraint("T",DataTypeImpl::GetTensorType<MLFloat16>()),HalfConv<false>);
+ONNX_OPERATOR_VERSIONED_TYPED_KERNEL_EX(Conv_nhwc,kOnnxDomain,1,11,MLFloat16,kSystolicExecutionProvider,
+    KernelDefBuilder().TypeConstraint("T",DataTypeImpl::GetTensorType<MLFloat16>()),HalfConv<true>);
+
+}  // namespace systolic
+}  // namespace onnxruntime
+
+#endif  // SYSTOLIC_FP16

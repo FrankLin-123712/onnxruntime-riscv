@@ -30,6 +30,13 @@ class SystolicExecutionProvider : public IExecutionProvider {
  public:
   explicit SystolicExecutionProvider(const SystolicExecutionProviderInfo& info)
       : IExecutionProvider{onnxruntime::kSystolicExecutionProvider}, provider_info_(info) {
+#ifdef SYSTOLIC_FP16
+    ORT_ENFORCE(info.accelerator_mode == 0 || info.accelerator_mode == 2,
+                "FP16 Systolic supports CPU reference (0) or WS (2) only");
+#ifndef __riscv
+    ORT_ENFORCE(info.accelerator_mode == 0, "WS execution requires a RISC-V Gemmini target");
+#endif
+#endif
     SetupFusedRules();
 
     bool create_arena = info.create_arena;

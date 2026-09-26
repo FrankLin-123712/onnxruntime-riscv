@@ -12,8 +12,10 @@
 #include <limits.h>
 #include <stdbool.h>
 
-#if defined(SYSTOLIC_FP32) &&  defined(SYSTOLIC_INT8)
-#error Currently do not support both fp and int8 at same time
+#if (defined(SYSTOLIC_FP32) + defined(SYSTOLIC_FP16) + defined(SYSTOLIC_INT8)) != 1
+#error Select exactly one of SYSTOLIC_FP32, SYSTOLIC_FP16, or SYSTOLIC_INT8
+#elif defined(SYSTOLIC_FP16)
+#include "systolic_params_fp16.h"
 #elif defined(SYSTOLIC_FP32)
 #include "systolic_params_fp32.h"
 #elif defined(SYSTOLIC_INT8)

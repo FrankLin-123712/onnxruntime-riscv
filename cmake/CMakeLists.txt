@@ -65,6 +65,13 @@ option(onnxruntime_USE_HWACHA "Whether to build with Hwacha support" OFF)
 option(onnxruntime_FOR_FIRESIM "Whether to build for Firesim benchmarking" OFF)
 option(onnxruntime_SYSTOLIC_INT8 "If Systolic is enabled, whether to use for int8 ops" OFF)
 option(onnxruntime_SYSTOLIC_FP32 "If Systolic is enabled, whether to use for fp32 ops" ON)
+option(onnxruntime_SYSTOLIC_FP16 "Use DPVO FP16 DIM32 WS Gemmini kernels" OFF)
+if(onnxruntime_SYSTOLIC_FP16 AND (onnxruntime_SYSTOLIC_FP32 OR onnxruntime_SYSTOLIC_INT8))
+  message(FATAL_ERROR "Select one systolic datatype; FP16 requires SYSTOLIC_FP32=OFF and SYSTOLIC_INT8=OFF")
+endif()
+if(onnxruntime_SYSTOLIC_FP16 AND onnxruntime_ENABLE_TRAINING)
+  message(FATAL_ERROR "FP16 systolic training kernels are not supported")
+endif()
 if(onnxruntime_SYSTOLIC_FP32)
   message(STATUS "BUILDING FOR FP32 SYSTOLIC")
 endif()
@@ -1329,6 +1336,26 @@ if(onnxruntime_USE_HWACHA)
 endif()
 if(onnxruntime_FOR_FIRESIM)
   add_definitions(-DFOR_FIRESIM=1)
+endif()
+
+if(onnxruntime_SYSTOLIC_FP16)
+  include(CheckCXXSourceCompiles)
+  # Recheck when a build directory is reconfigured with different ISA flags.
+  unset(ORT_NATIVE_FLOAT16_SUPPORTED CACHE)
+  check_cxx_source_compiles("
+    #if !defined(__FLT16_MANT_DIG__) || __FLT16_MANT_DIG__ != 11 || __FLT16_MAX_EXP__ != 16
+    #error IEEE binary16 is required
+    #endif
+    #if defined(__riscv) && !defined(__riscv_zfh)
+    #error RISC-V FP16 requires Zfh
+    #endif
+    static_assert(sizeof(_Float16) == 2, \"binary16 size\");
+    int main() { volatile float x = 1.5f; _Float16 h = static_cast<_Float16>(x); return static_cast<float>(h) != x; }
+    " ORT_NATIVE_FLOAT16_SUPPORTED)
+  if(NOT ORT_NATIVE_FLOAT16_SUPPORTED)
+    message(FATAL_ERROR "FP16 requires _Float16 support; RISC-V also requires -march=rv64imafdc_zfh")
+  endif()
+  add_definitions(-DSYSTOLIC_FP16=1)
 endif()
 
 if(onnxruntime_SYSTOLIC_INT8)

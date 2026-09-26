@@ -1,3 +1,25 @@
+#pragma once
+#include <cstddef>
+#include <cstdint>
+#ifdef SYSTOLIC_FP16
+// Raw IEEE binary16 A/B/C; D is FP32. Strides count elements, not bytes.
+// mode 0: portable numerical reference; mode 2: DPVO FP16 DIM32 WS hardware.
+void SystolicHalfMatmul(char mode, size_t m, size_t n, size_t k,
+                       const uint16_t* a, size_t lda,
+                       const uint16_t* b, size_t ldb,
+                       const float* d, size_t ldd,
+                       uint16_t* c, size_t ldc,
+                       bool repeating_bias = false, bool relu = false,
+                       float output_scale = 1.0f,
+                       float* full_output = nullptr);
+
+bool SystolicHalfConvRect(char mode, int64_t batch,
+                         int64_t ih, int64_t iw, int64_t ci,
+                         int64_t co, int64_t oh, int64_t ow,
+                         int64_t stride, int64_t pad, int64_t kernel,
+                         const uint16_t* input, const uint16_t* weights,
+                         const float* bias, uint16_t* output, bool relu);
+#endif
 void SystolicFlush();
 
 #ifdef SYSTOLIC_INT8

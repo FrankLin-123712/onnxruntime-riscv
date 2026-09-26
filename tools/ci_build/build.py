@@ -407,6 +407,11 @@ def parse_arguments():
         "--use_nuphar", action='store_true', help="Build with nuphar")
     parser.add_argument(
         "--use_hwacha", action='store_true', help="Build with Hwacha support")
+    precision = parser.add_mutually_exclusive_group()
+    precision.add_argument("--systolic_fp16", action="store_true",
+                           help="FP16 Gemmini kernels (RISC-V CPU requires Zfh)")
+    precision.add_argument("--systolic_fp32", action="store_true",
+                           help="FP32 Gemmini kernels (default)")
     parser.add_argument(
         "--for_firesim", action='store_true', help="Build for Firesim & disable debug print")
     parser.add_argument(
@@ -645,6 +650,8 @@ def setup_test_data(build_dir, configs):
 
 
 def use_dev_mode(args):
+    if args.riscv:
+        return "OFF"  # Vendored dependencies predate the RISC-V GCC toolchain.
     if args.use_acl:
         return 'OFF'
     if args.use_armnn:
@@ -666,6 +673,9 @@ def generate_build_tree(cmake_path, source_dir, build_dir, cuda_home, cudnn_home
         "-DCMAKE_SYSTEM_NAME=Linux",
         "-DUNIX=True",
         "-Donnxruntime_USE_SYSTOLIC=" + "ON",
+        "-Donnxruntime_SYSTOLIC_FP16=" + ("ON" if args.systolic_fp16 else "OFF"),
+        "-Donnxruntime_SYSTOLIC_FP32=" + ("OFF" if args.systolic_fp16 else "ON"),
+        "-Donnxruntime_SYSTOLIC_INT8=OFF",
         "-Donnxruntime_FOR_FIRESIM=" + ("ON" if args.for_firesim else "OFF"),
         "-Donnxruntime_USE_HWACHA=" + ("ON" if args.use_hwacha else "OFF"),
         "-Donnxruntime_RUN_ONNX_TESTS=" + ("ON" if args.enable_onnx_tests else "OFF"),
@@ -766,6 +776,14 @@ def generate_build_tree(cmake_path, source_dir, build_dir, cuda_home, cudnn_home
     ]
     if args.riscv:
         cmake_args += ["-DCMAKE_SYSTEM_PROCESSOR=riscv"]
+        # Set cache entries explicitly: environment CXXFLAGS only affects the first configure.
+        arch = "rv64imafdc_zfh" if args.systolic_fp16 else "rv64imafdc"
+        if args.use_hwacha:
+            if args.systolic_fp16:
+                raise BuildError("--use_hwacha cannot be combined with --systolic_fp16")
+            arch = "rv64gcxhwacha"
+        cmake_args += ["-DCMAKE_C_FLAGS=-march=" + arch + " -mabi=lp64d",
+                       "-DCMAKE_CXX_FLAGS=-march=" + arch + " -mabi=lp64d"]
 
     if acl_home and os.path.exists(acl_home):
         cmake_args += ["-Donnxruntime_ACL_HOME=" + acl_home]
@@ -983,6 +1001,12 @@ def generate_build_tree(cmake_path, source_dir, build_dir, cuda_home, cudnn_home
 
     cmake_args += cmake_extra_args
 
+    if args.riscv:
+        # Pin existing caches as well as fresh builds, after user CMake options.
+        toolchain = os.path.abspath(os.path.join(source_dir, "../../../..", ".conda-env/riscv-tools/bin"))
+        cmake_args += ["-DCMAKE_C_COMPILER=" + os.path.join(toolchain, "riscv64-unknown-linux-gnu-gcc"),
+                       "-DCMAKE_CXX_COMPILER=" + os.path.join(toolchain, "riscv64-unknown-linux-gnu-g++")]
+
     # ADO pipelines will store the pipeline build number
     # (e.g. 191101-2300.1.master) and source version in environment
     # variables. If present, use these values to define the
@@ -1061,6 +1085,17 @@ def build_targets(args, cmake_path, build_dir, configs, num_parallel_jobs, targe
                     "--config", config]
         if target:
             cmd_args.extend(['--target', target])
+        elif args.riscv:
+            # Static libraries used by the runners; cross-built unit-test executables
+            # are not runnable on the build host. --target still selects any CMake target.
+            cmd_args += ['--target', 'onnxruntime_session', 'onnxruntime_optimizer',
+                         'onnxruntime_providers', 'onnxruntime_providers_systolic',
+                         'onnxruntime_util', 'onnxruntime_framework', 'onnxruntime_graph',
+                         'onnxruntime_common', 'onnxruntime_mlas', 'onnxruntime_flatbuffers',
+                         'onnx_test_runner_common', 'onnxruntime_test_utils',
+                         'onnx_test_data_proto', 're2', 'nsync_cpp']
+            if args.use_hwacha:
+                cmd_args.append('onnxruntime_providers_hwacha')
 
         build_tool_args = []
         if num_parallel_jobs != 1:

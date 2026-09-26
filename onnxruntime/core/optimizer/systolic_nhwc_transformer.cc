@@ -484,7 +484,11 @@ void SystolicNhwcTransformerImpl::Transform(Node& node, const logging::Logger& l
   if (node.OpType() == "QLinearConv") {
     TransformConv<int8_t, ONNX_NAMESPACE::TensorProto_DataType_INT8>(node, logger, /*weightIdx= */ 3, /*biasIdx= */ 8);
   } else if (node.OpType() == "Conv") {
-    TransformConv<float, ONNX_NAMESPACE::TensorProto_DataType_FLOAT>(node, logger, /*weightIdx= */ 1, /*biasIdx= */ 2);
+    if (node.InputDefs()[0]->TypeAsProto()->tensor_type().elem_type() == ONNX_NAMESPACE::TensorProto_DataType_FLOAT16) {
+      TransformConv<uint16_t, ONNX_NAMESPACE::TensorProto_DataType_FLOAT16>(node, logger, 1, 2);
+    } else {
+      TransformConv<float, ONNX_NAMESPACE::TensorProto_DataType_FLOAT>(node, logger, 1, 2);
+    }
   } else if (node.GetInputEdgesCount() == 0 && node.InputDefs().size() != 0) {
     // The following transforms only run when the input edge count has already
     // been decremented to zero by earlier transforms. This is a hint that the
