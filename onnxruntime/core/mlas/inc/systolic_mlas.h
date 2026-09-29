@@ -147,3 +147,31 @@ void SystolicConvBackpropFilter(char accelerator_mode, int batch_size, int in_di
                   float output_scale);
                             
 #endif
+
+#if defined(__riscv) && defined(SYSTOLIC_FP32) && !defined(SYSTOLIC_FP16)
+// FP32 DIM16 correlation gather, implemented in systolic.cpp / MLAS.
+// DPVO_CORR_GATHER gates the runner call site, not this shared MLAS API.
+// These routines issue CGR1 instructions only when explicitly called. Probe is
+// permitted only with a matching bitstream; an older bitstream may hang.
+namespace systolic_corr {
+// One 8x8 window in a contiguous FP32 [128,H,W] feature tensor.
+// x/y are signed integer window origins, not floating-point sample centers.
+struct Window {
+  const float* data;
+  uint32_t height, width;
+  int32_t x, y;
+};
+struct GatherStatistics {
+  uint64_t cycles, useful_bytes, strips, rows, read_stalls, write_stalls;
+};
+
+void Probe();
+// Caller validates tensor/coordinate bounds and opts into matching CGR1 hardware.
+// Load A[1,128], gather both windows into native B tiles, wait and check status,
+// then return this job's counters. Throws on error; partial B must not be used.
+// Gather/DotPreloaded require exclusive Gemmini use; do not interleave operations.
+GatherStatistics Gather(const float* a, const Window& level0, const Window& level1);
+// Consume the A/B prepared by Gather -> 128 FP32 dots; restore loop SPAD bounds.
+void DotPreloaded(float* output);
+}  // namespace systolic_corr
+#endif

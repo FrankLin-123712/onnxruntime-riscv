@@ -136,6 +136,9 @@ void SystolicFlush() {
 #include <stdio.h>
 #include <stdexcept>
 #include "core/common/replay_profile.h"
+#ifdef SYSTOLIC_FP32
+#include "core/mlas/inc/mlas.h"
+#endif
 
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wunused-variable"
@@ -463,7 +466,7 @@ void SystolicConv(char accelerator_mode, int batch_size, int in_dim, int in_chan
                   elem_t* output,
                   bool relu,
                   float output_scale,
-                  int pool_size = 0, int pool_stride = 0, int pool_padding = 0) {
+                  int pool_size, int pool_stride, int pool_padding) {
   if (!ort_replay::Enabled("total")) printf("Called into systolic conv\n");
   if (pool_size != 0) {
     if (!ort_replay::Enabled("total")) printf("Using systolic pooling\n");
@@ -577,3 +580,88 @@ void cleargemmini() {
 #endif
 
 #endif  // SYSTOLIC_FP16
+
+// The CGR1 command sequence is provided by the same compiled implementation as
+// the other Systolic wrappers. DPVO_CORR_GATHER selects the runner call site;
+// shared MLAS builds do not carry that application flag. Defining these symbols
+// issues no CGR1 instructions. Call only after explicit matched-build opt-in.
+#if defined(__riscv) && defined(SYSTOLIC_FP32) && !defined(SYSTOLIC_FP16)
+static_assert(DIM == 16 && BANK_NUM == 4 && BANK_ROWS == 1024 && ACC_ROWS == 1024,
+              "Correlation gather requires the FP32 DIM16 256KiB-SPAD / 64KiB-ACC ABI");
+static_assert(sizeof(elem_t) == 4 && sizeof(acc_t) == 4, "FP32 gather ABI");
+
+namespace systolic_corr {
+// The legacy fence macro lacks a compiler memory clobber. The direct-SPAD
+// wrapper must also order CPU feature stores and prevent cached C loads.
+static inline void Fence() { asm volatile("fence" ::: "memory"); }
+
+void Probe() {
+  Fence();
+  const uint64_t status = gemmini_corr_status(GEMMINI_CORR_COUNTER_STATUS);
+  if ((status & GEMMINI_CORR_MAGIC_MASK) != GEMMINI_CORR_MAGIC ||
+      !(status & GEMMINI_CORR_ENABLED) || (status & (GEMMINI_CORR_BUSY | GEMMINI_CORR_ERROR)))
+    throw std::runtime_error("--corr-gather requires matching enabled CGR1 hardware; invalid status");
+}
+
+static void LoadA(const float* a) {
+  // Do not depend on load state left by a convolution or another matmul.
+  Fence();
+  gemmini_extended3_config_ld(128 * sizeof(float), MVIN_SCALE_IDENTITY, false, 0);
+  asm volatile("" ::: "memory");
+  for (uint32_t k = 0; k < 8; ++k) {
+    gemmini_extended_mvin(a + 16 * k, GEMMINI_CORR_A_BASE + 16 * k, 16, 1);
+  }
+  Fence();
+}
+
+static uint64_t WaitGather() {
+  Fence();
+  const uint64_t status = gemmini_corr_status(GEMMINI_CORR_COUNTER_STATUS);
+  if ((status & GEMMINI_CORR_MAGIC_MASK) != GEMMINI_CORR_MAGIC ||
+      !(status & GEMMINI_CORR_ENABLED) || (status & (GEMMINI_CORR_BUSY | GEMMINI_CORR_ERROR)))
+    throw std::runtime_error("Correlation gather failed or incomplete; refusing to consume SPAD B");
+  const uint64_t rows = gemmini_corr_status(GEMMINI_CORR_COUNTER_ROWS);
+  if (rows != GEMMINI_CORR_B_ROWS)
+    throw std::runtime_error("Correlation gather row count mismatch; refusing to consume SPAD B");
+  return rows;
+}
+
+GatherStatistics Gather(const float* a, const Window& level0, const Window& level1) {
+  LoadA(a);
+  gemmini_corr_config(reinterpret_cast<uint64_t>(level0.data),
+      reinterpret_cast<uint64_t>(level1.data), level0.height, level0.width,
+      level1.height, level1.width);
+  asm volatile("" ::: "memory");
+  gemmini_corr_start(level0.x, level0.y, level1.x, level1.y, GEMMINI_CORR_B_BASE);
+  const uint64_t rows = WaitGather();
+  return {gemmini_corr_status(GEMMINI_CORR_COUNTER_CYCLES),
+      gemmini_corr_status(GEMMINI_CORR_COUNTER_USEFUL_BYTES),
+      gemmini_corr_status(GEMMINI_CORR_COUNTER_STRIPS), rows,
+      gemmini_corr_status(GEMMINI_CORR_COUNTER_READ_STALL),
+      gemmini_corr_status(GEMMINI_CORR_COUNTER_WRITE_STALL)};
+}
+
+void DotPreloaded(float* output) {
+  gemmini_extended_config_st(128 * sizeof(float), NO_ACTIVATION, ACC_SCALE_IDENTITY);
+  // Explicitly reset A/C strides, transpose, activation and Im2Col configuration.
+  gemmini_extended3_config_ex(WEIGHT_STATIONARY, NO_ACTIVATION, 0, ACC_SCALE_IDENTITY,
+      0, 1, 1, false, false, 0, 0, 0, 0, 0, 0, 0, 0, 0, false);
+  ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, UINT64_C(15),
+      (UINT64_C(8) << 32) | (UINT64_C(8) << 16) | 1, k_LOOP_WS_CONFIG_BOUNDS);
+  ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, UINT64_C(0), UINT64_C(0), k_LOOP_WS_CONFIG_ADDRS_AB);
+  ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, UINT64_C(0), (uint64_t)output, k_LOOP_WS_CONFIG_ADDRS_DC);
+  ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, UINT64_C(128), UINT64_C(128), k_LOOP_WS_CONFIG_STRIDES_AB);
+  ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, UINT64_C(128), UINT64_C(128), k_LOOP_WS_CONFIG_STRIDES_DC);
+  // funct24: rs2 is B's exclusive END, not its base.
+  ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, (uint64_t)GEMMINI_CORR_A_BASE,
+      (uint64_t)(GEMMINI_CORR_B_BASE + GEMMINI_CORR_B_ROWS), 24);
+  // rs1=0: explicit A/B SPAD ids, no bias/activation/initial accumulation.
+  // Skip A/B only. D=0 still runs empty ldD to advance its accumulator cursor.
+  // spad_only=0 leaves normal accumulator-to-memory output enabled.
+  // Restore this loop slot's original SPAD bounds before ordinary MLAS reuse.
+  ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, UINT64_C(0), (UINT64_C(1) << 3) | (UINT64_C(1) << 4) |
+      GEMMINI_CORR_RESTORE_SPAD_DEFAULTS, k_LOOP_WS);
+  Fence();
+}
+}  // namespace systolic_corr
+#endif

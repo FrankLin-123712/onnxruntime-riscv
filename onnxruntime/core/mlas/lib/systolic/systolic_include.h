@@ -1,5 +1,52 @@
 // See LICENSE for license details.
 
+#ifndef SYSTOLIC_CORRELATION_GATHER_ABI_H
+#define SYSTOLIC_CORRELATION_GATHER_ABI_H
+#include <stdint.h>
+
+// Correlation gather ABI v1. Constants and row-layout helpers are available to
+// native validation tools without selecting a Gemmini datatype or emitting ISA.
+#define GEMMINI_CORR_CONFIG_GEOM 40
+#define GEMMINI_CORR_CONFIG_BASES 41
+#define GEMMINI_CORR_CONFIG_ORIGINS 42
+#define GEMMINI_CORR_GATHER 43
+#define GEMMINI_CORR_STATUS 44
+#define GEMMINI_CORR_MAGIC UINT64_C(0x4347523100000000)
+#define GEMMINI_CORR_MAGIC_MASK UINT64_C(0xffffffff00000000)
+#define GEMMINI_CORR_ENABLED UINT64_C(4)
+#define GEMMINI_CORR_BUSY UINT64_C(2)
+#define GEMMINI_CORR_ERROR UINT64_C(1)
+#define GEMMINI_CORR_B_BASE 0u
+#define GEMMINI_CORR_B_ROWS 1024u
+#define GEMMINI_CORR_A_BASE 2048u
+#define GEMMINI_CORR_A_ROWS 128u
+// LOOP_WS rs2 bit10: restore the consumed loop slot's default A/B region.
+#define GEMMINI_CORR_RESTORE_SPAD_DEFAULTS (UINT64_C(1) << 10)
+
+enum gemmini_corr_counter {
+  GEMMINI_CORR_COUNTER_STATUS = 0, GEMMINI_CORR_COUNTER_CYCLES = 1,
+  GEMMINI_CORR_COUNTER_USEFUL_BYTES = 2, GEMMINI_CORR_COUNTER_STRIPS = 3,
+  GEMMINI_CORR_COUNTER_ROWS = 4, GEMMINI_CORR_COUNTER_READ_STALL = 5,
+  GEMMINI_CORR_COUNTER_WRITE_STALL = 6
+};
+
+static inline uint64_t gemmini_corr_pair(uint32_t low, uint32_t high) {
+  return ((uint64_t)high << 32) | low;
+}
+
+// Addresses are scratchpad rows, never bytes. n is level*64 + gy*8 + gx.
+static inline uint32_t gemmini_corr_b_row(uint32_t base, uint32_t c, uint32_t n) {
+  return base + ((c / 16) * 8 + n / 16) * 16 + c % 16;
+}
+static inline uint32_t gemmini_corr_a_row(uint32_t base, uint32_t c) {
+  return base + (c / 16) * 16;
+}
+
+#endif // SYSTOLIC_CORRELATION_GATHER_ABI_H
+
+// Native validation tools can read the ABI without choosing a datatype or
+// parsing hardware kernels. Separate guards allow a later full inclusion.
+#ifndef SYSTOLIC_ABI_ONLY
 #ifndef SRC_MAIN_C_GEMMINI_H
 #define SRC_MAIN_C_GEMMINI_H
 
@@ -74,7 +121,7 @@
 #define RELU6 2
 
 #ifdef ELEM_T_IS_FLOAT
-elem_t elem_t_bits_to_elem_t(elem_t_bits x) {
+static inline elem_t elem_t_bits_to_elem_t(elem_t_bits x) {
     union {
         elem_t_bits b;
         elem_t f;
@@ -84,7 +131,7 @@ elem_t elem_t_bits_to_elem_t(elem_t_bits x) {
     return un.f;
 }
 
-elem_t_bits elem_t_to_elem_t_bits(elem_t x) {
+static inline elem_t_bits elem_t_to_elem_t_bits(elem_t x) {
     union {
         elem_t_bits b;
         elem_t f;
@@ -94,7 +141,7 @@ elem_t_bits elem_t_to_elem_t_bits(elem_t x) {
     return un.b;
 }
 
-acc_t acc_t_bits_to_acc_t(acc_t_bits x) {
+static inline acc_t acc_t_bits_to_acc_t(acc_t_bits x) {
     union {
         acc_t_bits b;
         acc_t f;
@@ -104,7 +151,7 @@ acc_t acc_t_bits_to_acc_t(acc_t_bits x) {
     return un.f;
 }
 
-acc_t_bits acc_t_to_acc_t_bits(acc_t x) {
+static inline acc_t_bits acc_t_to_acc_t_bits(acc_t x) {
     union {
         acc_t_bits b;
         acc_t f;
@@ -114,7 +161,7 @@ acc_t_bits acc_t_to_acc_t_bits(acc_t x) {
     return un.b;
 }
 
-bool elem_t_isnan(elem_t x) {
+static inline bool elem_t_isnan(elem_t x) {
     elem_t_bits bits = elem_t_to_elem_t_bits(x);
     uint64_t exp = (bits >> (ELEM_T_SIG_BITS-1)) & (((uint64_t)1 << ELEM_T_EXP_BITS) - 1);
     uint64_t sig = bits & (((uint64_t)1 << ELEM_T_SIG_BITS) - 1);
@@ -123,7 +170,7 @@ bool elem_t_isnan(elem_t x) {
     return is_nan_or_inf && is_not_inf;
 }
 
-bool acc_t_isnan(acc_t x) {
+static inline bool acc_t_isnan(acc_t x) {
     acc_t_bits bits = acc_t_to_acc_t_bits(x);
     uint64_t exp = (bits >> (ACC_T_SIG_BITS-1)) & (((uint64_t)1 << ACC_T_EXP_BITS) - 1);
     uint64_t sig = bits & (((uint64_t)1 << ACC_T_SIG_BITS) - 1);
@@ -2913,6 +2960,30 @@ static void tiled_global_average_auto(const elem_t * input, elem_t * output,
       channel_tile_size);
 }
 
+// No instruction is emitted merely by including this header. Old bitstreams
+// may not recognize STATUS; probe only after explicit matched-build opt-in.
+#ifdef __riscv
+static inline uint64_t gemmini_corr_status(uint32_t selector) {
+  uint64_t result;
+  ROCC_INSTRUCTION(XCUSTOM_ACC, result, (uint64_t)selector, UINT64_C(0), GEMMINI_CORR_STATUS);
+  return result;
+}
+static inline void gemmini_corr_config(uint64_t base0, uint64_t base1,
+    uint32_t h0, uint32_t w0, uint32_t h1, uint32_t w1) {
+  ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, gemmini_corr_pair(w0, h0),
+      gemmini_corr_pair(w1, h1), GEMMINI_CORR_CONFIG_GEOM);
+  ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, base0, base1, GEMMINI_CORR_CONFIG_BASES);
+}
+static inline void gemmini_corr_start(int32_t bx0, int32_t by0,
+    int32_t bx1, int32_t by1, uint32_t b_base) {
+  ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, gemmini_corr_pair((uint32_t)bx0, (uint32_t)by0),
+      gemmini_corr_pair((uint32_t)bx1, (uint32_t)by1), GEMMINI_CORR_CONFIG_ORIGINS);
+  ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, (uint64_t)b_base, UINT64_C(0), GEMMINI_CORR_GATHER);
+}
+#endif
+
+
 #undef abs
 
 #endif // SRC_MAIN_C_GEMMINI_H
+#endif // !SYSTOLIC_ABI_ONLY
