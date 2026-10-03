@@ -137,6 +137,9 @@ void SystolicFlush() {
 #include <stdexcept>
 #include "core/common/replay_profile.h"
 #ifdef SYSTOLIC_FP32
+#include <algorithm>
+#include <limits>
+#include <vector>
 #include "core/mlas/inc/mlas.h"
 #endif
 
@@ -150,6 +153,123 @@ void SystolicFlush() {
 
 #ifdef SYSTOLIC_FP32
 #include "conv_rect.h"
+
+namespace {
+struct PointwiseTile { size_t co, spatial, ci; };  // Counts of DIM-sized blocks.
+
+PointwiseTile SelectPointwiseTile(size_t co, size_t spatial, size_t ci) {
+  constexpr size_t acc_blocks = ACC_ROWS / (2 * DIM);
+  constexpr size_t sp_blocks = BANK_NUM * BANK_ROWS / (2 * DIM);
+  static_assert(acc_blocks >= 1 && sp_blocks >= 2, "WS pointwise tile capacity");
+  const auto blocks = [](size_t n) { return n / DIM + (n % DIM != 0); };
+  const auto divide_up = [](size_t n, size_t d) { return n / d + (n % d != 0); };
+  PointwiseTile best{1, 1, 1};
+  long double best_loops = std::numeric_limits<long double>::infinity();
+  long double best_loads = best_loops;
+  // Bounded by on-chip capacity, never by the full spatial tensor size.
+  // Reserve half of both memories for the WS loop's double buffering.
+  for (size_t i = 1; i <= std::min(blocks(co), acc_blocks); ++i) {
+    for (size_t j = 1; j <= std::min(blocks(spatial), acc_blocks / i); ++j) {
+      const size_t k = std::min(blocks(ci), sp_blocks / (i + j));
+      if (k == 0) continue;
+      const long double loops = static_cast<long double>(divide_up(co, i * DIM)) *
+          divide_up(spatial, j * DIM) * divide_up(ci, k * DIM);
+      const long double loads = loops * (i + j) * k;
+      if (loops < best_loops || (loops == best_loops && loads < best_loads)) {
+        best = {i, j, k};
+        best_loops = loops;
+        best_loads = loads;
+      }
+    }
+  }
+  return best;
+}
+}  // namespace
+
+bool SystolicConv1x1Nchw(char accelerator_mode, int64_t batch,
+                        int64_t input_h, int64_t input_w, int64_t input_channels,
+                        int64_t output_channels, const float* input,
+                        const float* weights, const float* bias,
+                        float* output, bool relu) {
+  if (accelerator_mode < 0 || accelerator_mode > 2 || batch < 0 ||
+      input_h < 0 || input_w < 0 || input_channels <= 0 || output_channels <= 0)
+    return false;
+  if (batch == 0 || input_h == 0 || input_w == 0) return true;
+  if (!input || !weights || !output) return false;
+
+  // CONFIG_LD/ST encode byte strides in 32 bits; also reject pointer-offset
+  // and tensor-size overflow before allocating bias storage or writing output.
+  constexpr uint64_t max_elements =
+      static_cast<uint64_t>(std::numeric_limits<ptrdiff_t>::max()) / sizeof(float);
+  const uint64_t n = static_cast<uint64_t>(batch);
+  const uint64_t h = static_cast<uint64_t>(input_h), w = static_cast<uint64_t>(input_w);
+  const uint64_t ci = static_cast<uint64_t>(input_channels);
+  const uint64_t co = static_cast<uint64_t>(output_channels);
+  if (h > max_elements / w) return false;
+  const size_t spatial = static_cast<size_t>(h * w);
+  if (ci > UINT32_MAX / sizeof(float) || spatial > UINT32_MAX / sizeof(float) ||
+      n > max_elements / spatial) return false;
+  const uint64_t pixels = n * spatial;
+  if (ci > max_elements / pixels || co > max_elements / pixels ||
+      co > max_elements / ci) return false;
+
+  const PointwiseTile tile = SelectPointwiseTile(co, spatial, ci);
+  const size_t tile_co = tile.co * DIM, tile_spatial = tile.spatial * DIM;
+  ort_replay::Scope profile("kernel", "conv.1x1_nchw", "Conv", "SystolicExecutionProvider");
+  if (profile.Active()) {
+    const std::string detail = "path=pointwise_gemm;input_layout=NHWC;output_layout=NCHW;"
+        "weight_layout=OIHW;transB=1;execution=" + std::to_string(int(accelerator_mode)) +
+        ";N=" + std::to_string(n) + ";P=" + std::to_string(spatial) +
+        ";CI=" + std::to_string(ci) + ";CO=" + std::to_string(co) +
+        ";tiling=capacity_v1;tile=" + std::to_string(tile_co) + "x" +
+        std::to_string(tile_spatial) + "x" + std::to_string(tile.ci * DIM) +
+        ";bias=" + (bias ? "row_tile" : "none") + ";fused_relu=" + std::to_string(relu);
+    profile.Detail(detail.c_str());
+  }
+  if (accelerator_mode != 2) {
+    for (size_t b = 0; b < n; ++b) for (size_t c = 0; c < co; ++c) {
+      for (size_t p = 0; p < spatial; ++p) {
+        float sum = bias ? bias[c] : 0.0f;
+        for (size_t k = 0; k < ci; ++k)
+          sum += weights[c * ci + k] * input[(b * spatial + p) * ci + k];
+        output[(b * co + c) * spatial + p] = relu && sum < 0 ? 0.0f : sum;
+      }
+    }
+    return true;
+  }
+
+  // Gemmini's repeating_bias repeats one row across output channels, whereas
+  // Conv bias repeats each channel's scalar across spatial columns. Materialize
+  // only one bounded tile (at most ACC_ROWS * DIM / 2 FP32 elements), initialize
+  // it once per channel tile and reuse it for all spatial tiles and batches.
+  std::vector<float> bias_tile(bias ? tile_co * tile_spatial : 0);
+  asm volatile("fence" ::: "memory");
+  for (size_t c = 0; c < co; c += tile_co) {
+    const size_t channels = std::min(tile_co, static_cast<size_t>(co) - c);
+    if (bias) {
+      for (size_t r = 0; r < channels; ++r)
+        std::fill_n(bias_tile.data() + r * tile_spatial, tile_spatial, bias[c + r]);
+      asm volatile("fence" ::: "memory");
+    }
+    for (size_t b = 0; b < n; ++b) for (size_t p = 0; p < spatial; p += tile_spatial) {
+      const size_t columns = std::min(tile_spatial, spatial - p);
+      // W[CO,CI] * X[P,CI]^T writes directly to Y[CO,P]. Real source/output
+      // strides preserve the original layouts even on the final partial tile.
+      tiled_matmul(channels, columns, ci, weights + c * ci,
+          input + (b * spatial + p) * ci, bias ? bias_tile.data() : nullptr,
+          output + (b * co + c) * spatial + p, ci, ci, tile_spatial, spatial,
+          MVIN_SCALE_IDENTITY, MVIN_SCALE_IDENTITY, MVIN_SCALE_IDENTITY,
+          relu ? RELU : NO_ACTIVATION, ACC_SCALE_IDENTITY, 0, false,
+          (channels + DIM - 1) / DIM, (columns + DIM - 1) / DIM, tile.ci,
+          false, true, false, false, 0, WS);
+      // tiled_matmul waits for DMA but its legacy fence has no compiler
+      // clobber: do not let the next channel tile's bias stores move earlier.
+      asm volatile("" ::: "memory");
+    }
+  }
+  asm volatile("fence" ::: "memory");
+  return true;
+}
 
 // NHWC/HWIO rectangular WS convolution; false means no instructions issued.
 bool SystolicConvRect(char accelerator_mode, int64_t batch,

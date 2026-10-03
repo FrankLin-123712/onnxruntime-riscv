@@ -18,9 +18,56 @@
 #endif
 
 #ifdef SYSTOLIC_FP32
+#include "core/mlas/inc/systolic_mlas.h"
 
 namespace onnxruntime {
 namespace systolic {
+
+// Internal pointwise boundary kernel. The graph transformer has already
+// validated convolution attributes; this operator's layout is unambiguous:
+// X=NHWC, W=OIHW (1x1), Y=NCHW. No activation tensor is transposed on the CPU.
+class Conv1x1NhwcNchw final : public OpKernel {
+ public:
+  explicit Conv1x1NhwcNchw(const OpKernelInfo& info)
+      : OpKernel(info), relu_(info.GetAttrOrDefault<int64_t>("relu", 0) != 0),
+        mode_(static_cast<const SystolicExecutionProvider*>(info.GetExecutionProvider())
+                  ->GetAcceleratorMode()) {}
+
+  Status Compute(OpKernelContext* context) const override {
+    ort_replay::Scope prepare("kernel", "conv.prepare");
+    const auto* x = context->Input<Tensor>(0);
+    const auto* w = context->Input<Tensor>(1);
+    const auto* bias = context->Input<Tensor>(2);
+    const auto& xs = x->Shape();
+    const auto& ws = w->Shape();
+    ORT_RETURN_IF_NOT(xs.NumDimensions() == 4 && ws.NumDimensions() == 4,
+                      "Conv1x1_nhwc_nchw requires rank-4 input and weights");
+    ORT_RETURN_IF_NOT(ws[2] == 1 && ws[3] == 1 && ws[1] == xs[3] &&
+                      ws[0] > 0 && ws[1] > 0,
+                      "Conv1x1_nhwc_nchw requires OIHW 1x1 weights matching NHWC channels");
+    ORT_RETURN_IF_NOT(bias == nullptr ||
+                      (bias->Shape().NumDimensions() == 1 && bias->Shape()[0] == ws[0]),
+                      "Conv1x1_nhwc_nchw bias must have shape [output_channels]");
+    auto* y = context->Output(0, TensorShape({xs[0], ws[0], xs[1], xs[2]}));
+    prepare.End();
+    if (y->Shape().Size() == 0) return Status::OK();
+    ORT_RETURN_IF_NOT(SystolicConv1x1Nchw(mode_, xs[0], xs[1], xs[2], xs[3], ws[0],
+                                        x->Data<float>(), w->Data<float>(),
+                                        bias ? bias->Data<float>() : nullptr,
+                                        y->MutableData<float>(), relu_),
+                      "Unsupported Conv1x1_nhwc_nchw dimensions or execution mode");
+    return Status::OK();
+  }
+
+ private:
+  bool relu_;
+  char mode_;
+};
+
+ONNX_OPERATOR_KERNEL_EX(
+    Conv1x1_nhwc_nchw, kOnnxDomain, 1, kSystolicExecutionProvider,
+    KernelDefBuilder().TypeConstraint("T", DataTypeImpl::GetTensorType<float>()),
+    Conv1x1NhwcNchw);
 
 ONNX_OPERATOR_KERNEL_EX(
     Conv,

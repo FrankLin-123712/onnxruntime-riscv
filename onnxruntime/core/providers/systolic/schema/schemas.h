@@ -335,6 +335,44 @@ void RegisterSystolicSchemas() {
 #endif
 
 #ifdef USE_SYSTOLIC
+  ONNX_SYSTOLIC_OPERATOR_SCHEMA(Conv1x1_nhwc_nchw)
+      .SinceVersion(1)
+      .SetDoc("Internal FP32 pointwise convolution: NHWC input, OIHW 1x1 weights, NCHW output. Unit stride, no padding, group=1; optional bias and Relu.")
+      .Input(0, "X", "NHWC input", "T")
+      .Input(1, "W", "OIHW weights with spatial shape 1x1", "T")
+      .Input(2, "B", "Per-output-channel bias", "T", OpSchema::Optional)
+      .Output(0, "Y", "NCHW output", "T")
+      .TypeConstraint("T", {"tensor(float)"}, "")
+      .Attr("relu", "", AttributeProto::INT, static_cast<int64_t>(0))
+      .TypeAndShapeInferenceFunction([](InferenceContext& ctx) {
+        ONNX_NAMESPACE::propagateElemTypeFromInputToOutput(ctx, 0, 0);
+        if (!ONNX_NAMESPACE::hasNInputShapes(ctx, 2)) return;
+        const auto& x = ONNX_NAMESPACE::getInputShape(ctx, 0);
+        const auto& w = ONNX_NAMESPACE::getInputShape(ctx, 1);
+        if (x.dim_size() != 4 || w.dim_size() != 4)
+          fail_shape_inference("Conv1x1_nhwc_nchw requires rank-4 input and weights");
+        for (int axis : {2, 3}) {
+          if (w.dim(axis).has_dim_value() && w.dim(axis).dim_value() != 1)
+            fail_shape_inference("Conv1x1_nhwc_nchw requires 1x1 weights");
+        }
+        if (x.dim(3).has_dim_value() && w.dim(1).has_dim_value() &&
+            x.dim(3).dim_value() != w.dim(1).dim_value())
+          fail_shape_inference("Conv1x1_nhwc_nchw input channel mismatch");
+        if (ctx.getNumInputs() > 2 && ONNX_NAMESPACE::hasInputShape(ctx, 2)) {
+          const auto& bias = ONNX_NAMESPACE::getInputShape(ctx, 2);
+          if (bias.dim_size() != 1 ||
+              (bias.dim(0).has_dim_value() && w.dim(0).has_dim_value() &&
+               bias.dim(0).dim_value() != w.dim(0).dim_value()))
+            fail_shape_inference("Conv1x1_nhwc_nchw bias shape mismatch");
+        }
+        TensorShapeProto y;
+        *y.add_dim() = x.dim(0);
+        *y.add_dim() = w.dim(0);
+        *y.add_dim() = x.dim(1);
+        *y.add_dim() = x.dim(2);
+        *ctx.getOutputType(0)->mutable_tensor_type()->mutable_shape() = y;
+      });
+
   // Internal kernels used to retain NHWC buffers and combine adjacent work.
   // AddRelu has CPU and Systolic implementations; InstanceNorm stays on CPU.
   ONNX_SYSTOLIC_OPERATOR_SCHEMA(AddRelu)

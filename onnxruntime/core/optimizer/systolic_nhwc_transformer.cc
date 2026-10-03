@@ -2,6 +2,7 @@
 // Licensed under the MIT License.
 
 #include <deque>
+#include <unordered_set>
 #include "core/graph/graph_utils.h"
 #include "core/optimizer/initializer.h"
 #include "core/optimizer/systolic_nhwc_transformer.h"
@@ -665,12 +666,81 @@ void SystolicNhwcTransformerImpl::Transform(Node& node, const logging::Logger& l
 }
 
 void SystolicNhwcTransformerImpl::Finalize(bool& modified, const logging::Logger& logger) {
+#ifdef SYSTOLIC_FP32
+  // Fused activations can leave several mappings pointing at one Conv. Only
+  // the surviving mapping may replace its producer, and a producer with two
+  // visible original outputs must retain the ordinary NHWC/reorder path.
+  std::unordered_map<NodeIndex, size_t> visible_original_outputs;
+  for (const auto& output : nhwc_args_) {
+    if (output.second->remaining_original_uses_ > 0)
+      ++visible_original_outputs[output.second->output_node_.Index()];
+  }
+  std::unordered_set<NodeIndex> replaced_pointwise_producers;
+
+  auto emit_nchw_pointwise_head = [&](NhwcArgument& output, NodeArg* original_arg) {
+    auto& producer = output.output_node_;
+    if (pretraining_pass_ ||
+        output.starting_original_uses_ != output.remaining_original_uses_ ||
+        visible_original_outputs[producer.Index()] != 1 ||
+        replaced_pointwise_producers.count(producer.Index()) != 0 ||
+        producer.OpType() != "Conv_nhwc" || producer.Domain() != kOnnxDomain ||
+        producer.GetExecutionProviderType() != kSystolicExecutionProvider ||
+        producer.InputDefs().size() < 2 || producer.InputDefs().size() > 3 ||
+        producer.OutputDefs().size() != 1 ||
+        producer.OutputDefs()[0] != output.nhwc_arg_) return false;
+
+    // These restrictions make spatial positions independent, so the kernel
+    // can write W[CO,CI] * X[NHWC]^T directly to the original NCHW buffer.
+    if (!IsAttributeUnsetOrWithExpectedValue(producer, "group", int64_t{1}) ||
+        !IsAttributeUnsetOrWithExpectedValue(producer, "maxpool", int64_t{0}) ||
+        !IsAttributeUnsetOrWithExpectedValues(producer, "kernel_shape", {1, 1}) ||
+        !IsAttributeUnsetOrWithExpectedValues(producer, "strides", {1, 1}) ||
+        !IsAttributeUnsetOrWithExpectedValues(producer, "dilations", {1, 1}) ||
+        !IsAttributeUnsetOrWithExpectedValues(producer, "pads", {0, 0, 0, 0}) ||
+        !(IsAttributeUnsetOrWithExpectedValue(producer, "auto_pad", std::string("NOTSET")) ||
+          IsAttributeUnsetOrWithExpectedValue(producer, "auto_pad", std::string("VALID")))) return false;
+
+    // TransformConv retains the original constant OIHW initializer. Reuse it
+    // instead of transposing HWIO weights again or packing them at execution.
+    NodeArg* original_weight = nullptr;
+    for (const auto& filter : filters_transposed) {
+      if (filter.second == producer.InputDefs()[1]) {
+        original_weight = filter.first;
+        break;
+      }
+    }
+    const ONNX_NAMESPACE::TensorProto* weight = nullptr;
+    if (!original_weight ||
+        !graph_.GetInitializedTensor(original_weight->Name(), weight) ||
+        weight->data_type() != ONNX_NAMESPACE::TensorProto_DataType_FLOAT ||
+        weight->dims_size() != 4 || weight->dims(0) <= 0 || weight->dims(1) <= 0 ||
+        weight->dims(2) != 1 || weight->dims(3) != 1) return false;
+
+    auto inputs = producer.MutableInputDefs();
+    inputs[1] = original_weight;
+    Node& head = graph_.AddNode(graph_.GenerateNodeName(producer.Name() + "_nchw_head"),
+                                "Conv1x1_nhwc_nchw", "FP32 pointwise Conv with direct NCHW output",
+                                inputs, {original_arg}, nullptr, kOnnxDomain);
+    head.SetExecutionProviderType(kSystolicExecutionProvider);
+    const auto* relu = graph_utils::GetNodeAttribute(producer, "relu");
+    if (relu) head.AddAttribute("relu", relu->i());
+    removed_nodes_.push_front(producer.Index());
+    replaced_pointwise_producers.insert(producer.Index());
+    LOGS(logger, VERBOSE) << "Writing terminal FP32 pointwise Conv directly to NCHW: "
+                          << original_arg->Name();
+    return true;
+  };
+#endif
+
   // Create ReorderOutput nodes for any NHWC outputs that still have uses with
   // the original tensor format.
   for (auto& nhwc_output : nhwc_args_) {
     if (nhwc_output.second->remaining_original_uses_ > 0) {
       auto* output_original_arg = nhwc_output.first;
       auto* output_nhwc_arg = nhwc_output.second->nhwc_arg_;
+#ifdef SYSTOLIC_FP32
+      if (emit_nchw_pointwise_head(*nhwc_output.second, output_original_arg)) continue;
+#endif
       LOGS(logger, VERBOSE) << "Inserting reorder to NCHW from " << output_nhwc_arg->Name() << " to " << output_original_arg->Name();
       Node& reorder_output_node = graph_.AddNode(graph_.GenerateNodeName("ReorderToNCHW"),
                                                  "Transpose",

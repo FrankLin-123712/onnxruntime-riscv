@@ -62,6 +62,17 @@ MLASCALL(char accelerator_mode, int batch_size, int in_dim, int in_channels,
 
 #ifdef SYSTOLIC_FP32
 
+// Group-1, stride-1, unpadded 1x1 Conv: NHWC input, original OIHW weights,
+// and NCHW output. Mode 2 uses WS W * X^T; modes 0/1 are CPU references.
+// False means unsupported dimensions/mode/buffers, with no output writes or
+// accelerator instructions. Empty batch/spatial dimensions succeed as a no-op.
+// Output must not overlap input, weights, or bias.
+bool SystolicConv1x1Nchw(char accelerator_mode, int64_t batch,
+                        int64_t input_h, int64_t input_w, int64_t input_channels,
+                        int64_t output_channels, const float* input,
+                        const float* weights, const float* bias,
+                        float* output, bool relu);
+
 // Elementwise (in1 * in1_scale + in2 * in2_scale) / out_scale.
 // Mode 2 uses the Gemmini accumulator and optional store-side ReLU; other
 // modes use the CPU reference. Buffers contain dim contiguous FP32 elements.
