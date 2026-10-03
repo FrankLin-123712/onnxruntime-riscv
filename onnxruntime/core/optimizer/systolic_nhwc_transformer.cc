@@ -54,7 +54,7 @@ class SystolicNhwcTransformerImpl {
   void TransformQLinearAdd(Node& node, const logging::Logger& logger);
   void TransformFloatAdd(Node& node, const logging::Logger& logger);
   bool FuseReluWithNhwcProducer(Node& node, const logging::Logger& logger);
-  bool FuseReluWithCpuAdd(Node& node, const logging::Logger& logger);
+  bool FuseReluWithFloatAdd(Node& node, const logging::Logger& logger);
   void TransformInstanceNormalization(Node& node, const logging::Logger& logger);
   void TransformMaxPool(Node& node, const logging::Logger& logger);
   bool FuseMaxPoolWithConv(Node& node, const logging::Logger& logger);
@@ -357,11 +357,12 @@ bool SystolicNhwcTransformerImpl::FuseReluWithNhwcProducer(Node& node, const log
     --input.remaining_original_uses_;
     FuseNhwcArgument(node, input);
   } else if (producer.OpType() == "Add" && producer.Domain() == kOnnxDomain &&
-             producer.GetExecutionProviderType() == kCpuExecutionProvider) {
+             (producer.GetExecutionProviderType() == kCpuExecutionProvider ||
+              producer.GetExecutionProviderType() == kSystolicExecutionProvider)) {
     Node& fused = graph_.AddNode(graph_.GenerateNodeName(producer.Name() + "_relu"),
-                                "AddRelu", "FP32 CPU Add with fused Relu",
+                                "AddRelu", "FP32 Add with fused Relu",
                                 producer.MutableInputDefs(), producer.MutableOutputDefs(), nullptr, kOnnxDomain);
-    fused.SetExecutionProviderType(kCpuExecutionProvider);
+    fused.SetExecutionProviderType(producer.GetExecutionProviderType());
     // The original Add mapping has no remaining use after this activation.
     // The Relu output mapping must refer to the new producer, which survives
     // Finalize(), rather than the Add node queued for removal.
@@ -377,7 +378,7 @@ bool SystolicNhwcTransformerImpl::FuseReluWithNhwcProducer(Node& node, const log
   return true;
 }
 
-bool SystolicNhwcTransformerImpl::FuseReluWithCpuAdd(Node& node, const logging::Logger& logger) {
+bool SystolicNhwcTransformerImpl::FuseReluWithFloatAdd(Node& node, const logging::Logger& logger) {
   if (pretraining_pass_ || node.Domain() != kOnnxDomain ||
       node.GetExecutionProviderType() != kCpuExecutionProvider ||
       node.InputDefs().size() != 1 || node.OutputDefs().size() != 1 ||
@@ -386,24 +387,25 @@ bool SystolicNhwcTransformerImpl::FuseReluWithCpuAdd(Node& node, const logging::
   if (!type || !type->has_tensor_type() ||
       type->tensor_type().elem_type() != ONNX_NAMESPACE::TensorProto_DataType_FLOAT) return false;
   // Unmapped tensors retain ONNX's original axis order and broadcasting. Do
-  // not require NHWC for an elementwise CPU fusion.
+  // not require NHWC for an elementwise fusion.
   if (nhwc_args_.count(node.MutableInputDefs()[0])) return false;
   const auto& edge = *node.InputEdgesBegin();
   auto* producer = graph_.GetNode(edge.GetNode().Index());
   if (!producer || producer->OpType() != "Add" || producer->Domain() != kOnnxDomain ||
-      producer->GetExecutionProviderType() != kCpuExecutionProvider ||
+      (producer->GetExecutionProviderType() != kCpuExecutionProvider &&
+       producer->GetExecutionProviderType() != kSystolicExecutionProvider) ||
       producer->InputDefs().size() != 2 || producer->OutputDefs().size() != 1 ||
       producer->GetOutputEdgesCount() != 1 ||
       !graph_.GetNodeOutputsInGraphOutputs(*producer).empty()) return false;
   Node& fused = graph_.AddNode(graph_.GenerateNodeName(producer->Name() + "_relu"),
-                              "AddRelu", "FP32 CPU Add with fused Relu",
+                              "AddRelu", "FP32 Add with fused Relu",
                               producer->MutableInputDefs(), node.MutableOutputDefs(), nullptr, kOnnxDomain);
-  fused.SetExecutionProviderType(kCpuExecutionProvider);
+  fused.SetExecutionProviderType(producer->GetExecutionProviderType());
   graph_utils::RemoveNodeOutputEdges(graph_, node);
   graph_utils::RemoveNodeOutputEdges(graph_, *producer);
   removed_nodes_.push_front(node.Index());
   removed_nodes_.push_front(producer->Index());
-  LOGS(logger, VERBOSE) << "Fusing FP32 CPU Add and Relu in original layout";
+  LOGS(logger, VERBOSE) << "Fusing FP32 Add and Relu in original layout";
   return true;
 }
 
@@ -434,7 +436,9 @@ void SystolicNhwcTransformerImpl::TransformInstanceNormalization(Node& node,
 }
 
 void SystolicNhwcTransformerImpl::TransformFloatAdd(Node& node, const logging::Logger& logger) {
-  if (node.Domain() != kOnnxDomain || node.GetExecutionProviderType() != kCpuExecutionProvider ||
+  if (node.Domain() != kOnnxDomain ||
+      (node.GetExecutionProviderType() != kCpuExecutionProvider &&
+       node.GetExecutionProviderType() != kSystolicExecutionProvider) ||
       node.InputDefs().size() != 2 || node.OutputDefs().size() != 1) return;
   auto& inputs = node.MutableInputDefs();
   auto first = nhwc_args_.find(inputs[0]);
@@ -456,7 +460,7 @@ void SystolicNhwcTransformerImpl::TransformFloatAdd(Node& node, const logging::L
   --first->second->remaining_original_uses_;
   --second->second->remaining_original_uses_;
   CreateNhwcArgument(node, node, node.OutputDefs()[0]->Name());
-  LOGS(logger, VERBOSE) << "Keeping rank-4 FP32 CPU Add in NHWC";
+  LOGS(logger, VERBOSE) << "Keeping rank-4 FP32 Add in NHWC";
 }
 
 void SystolicNhwcTransformerImpl::TransformQLinearAdd(Node& node, const logging::Logger& logger) {
@@ -630,7 +634,7 @@ void SystolicNhwcTransformerImpl::Transform(Node& node, const logging::Logger& l
       TransformConv<float, ONNX_NAMESPACE::TensorProto_DataType_FLOAT>(node, logger, 1, 2);
     }
   } else if (node.OpType() == "Relu") {
-    if (!FuseReluWithNhwcProducer(node, logger) && !FuseReluWithCpuAdd(node, logger)) {
+    if (!FuseReluWithNhwcProducer(node, logger) && !FuseReluWithFloatAdd(node, logger)) {
       TransformPassThrough(node, logger);
     }
   } else if (node.OpType() == "InstanceNormalization") {

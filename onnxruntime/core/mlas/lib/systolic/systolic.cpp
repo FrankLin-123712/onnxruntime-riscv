@@ -420,6 +420,62 @@ void SystolicMultiply(char accelerator_mode, bool relu,
 /**
  * Adds two matrices elementwise
  */
+#ifdef SYSTOLIC_FP32
+void SystolicAdd(char accelerator_mode, bool relu, const float* A, float A_scale,
+                 const float* B, float B_scale, float* C, float C_scale, size_t dim) {
+  if (dim == 0) return;
+  if (!A || !B || !C || C_scale == 0)
+    throw std::invalid_argument("Invalid FP32 Add buffers or output scale");
+
+  ort_replay::Scope profile("kernel", "add.fp32", relu ? "AddRelu" : "Add",
+                            "SystolicExecutionProvider");
+  if (profile.Active()) {
+    const std::string detail = "dtype=fp32;elements=" + std::to_string(dim) +
+        ";fused_relu=" + std::to_string(relu) +
+        ";execution=" + std::to_string(static_cast<int>(accelerator_mode)) +
+        ";path=" + (accelerator_mode == 2 ? "accumulator" : "cpu");
+    profile.Detail(detail.c_str());
+  }
+
+  // Keep the existing scale convention, folding the output divisor into each
+  // input scale. ONNX FP32 Add passes identity scales throughout.
+  const float a_scale = A_scale / C_scale;
+  const float b_scale = B_scale / C_scale;
+  if (accelerator_mode != 2) {
+    // The INT8 residual-add reference clips to an integer minimum and cannot
+    // serve FP32. In particular, preserve NaN/Inf and signed zero here.
+    const bool identity_scale = a_scale == 1.0f && b_scale == 1.0f;
+    for (size_t i = 0; i < dim; ++i) {
+      const float sum = identity_scale ? A[i] + B[i] :
+          A[i] * a_scale + B[i] * b_scale;
+      C[i] = relu && sum < 0 ? 0.0f : sum;
+    }
+    return;
+  }
+
+  // A overwrites an accumulator tile; B's accumulating mvin2 adds to it.
+  // mvout applies ReLU to the sum, so no intermediate tensor or CPU pass is
+  // needed. A DIM-wide row gives a constant 64-byte stride and a tile capacity
+  // of ACC_ROWS * DIM elements, without the residual-add autotiler's linear
+  // search over a potentially very large tensor dimension.
+  static_assert(ACC_ROWS >= DIM && ACC_ROWS % DIM == 0,
+                "FP32 Add requires whole accumulator tiles");
+  asm volatile("fence" ::: "memory");
+  const size_t rows = dim / DIM;
+  if (rows != 0) {
+    tiled_resadd(rows, DIM, ACC_ROWS, DIM, a_scale, b_scale, 1.0f,
+                 A, B, C, relu, WS);
+  }
+  const size_t tail = dim % DIM;
+  if (tail != 0) {
+    const size_t offset = rows * DIM;
+    tiled_resadd(1, tail, 1, tail, a_scale, b_scale, 1.0f,
+                 A + offset, B + offset, C + offset, relu, WS);
+  }
+  // The legacy gemmini_fence macro has no compiler memory clobber.
+  asm volatile("fence" ::: "memory");
+}
+#else
 void SystolicAdd(char accelerator_mode __attribute__((unused)), bool relu, const elem_t* A, float A_scale, const elem_t* B,
                  float B_scale,
                  elem_t* C, float C_scale, int dim) {
@@ -454,6 +510,7 @@ void SystolicAdd(char accelerator_mode __attribute__((unused)), bool relu, const
                       /*C_scale= */ 1, A + resizedDim, B + resizedDim, C + resizedDim, relu, get_accelerator_mode(accelerator_mode));
   }
 }
+#endif
 
 /**
  * Convolution of two matrices. Input must be in NHWC format, weight must be in HWIO format

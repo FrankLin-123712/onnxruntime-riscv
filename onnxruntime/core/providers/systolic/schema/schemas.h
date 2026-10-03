@@ -335,11 +335,11 @@ void RegisterSystolicSchemas() {
 #endif
 
 #ifdef USE_SYSTOLIC
-  // Internal CPU kernels used to retain Systolic NHWC buffers and combine
-  // adjacent elementwise operations. Neither operator offloads to Gemmini.
+  // Internal kernels used to retain NHWC buffers and combine adjacent work.
+  // AddRelu has CPU and Systolic implementations; InstanceNorm stays on CPU.
   ONNX_SYSTOLIC_OPERATOR_SCHEMA(AddRelu)
       .SinceVersion(1)
-      .SetDoc("Internal FP32 CPU Add followed by Relu, with multidirectional broadcasting.")
+      .SetDoc("Internal FP32 Add followed by Relu, with multidirectional broadcasting.")
       .Input(0, "A", "", "T")
       .Input(1, "B", "", "T")
       .Output(0, "C", "", "T")

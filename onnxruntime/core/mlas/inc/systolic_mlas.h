@@ -62,6 +62,15 @@ MLASCALL(char accelerator_mode, int batch_size, int in_dim, int in_channels,
 
 #ifdef SYSTOLIC_FP32
 
+// Elementwise (in1 * in1_scale + in2 * in2_scale) / out_scale.
+// Mode 2 uses the Gemmini accumulator and optional store-side ReLU; other
+// modes use the CPU reference. Buffers contain dim contiguous FP32 elements.
+// Exact in-place output is supported; partial buffer overlap is not.
+void SystolicAdd
+MLASCALL(char accelerator_mode, bool relu, const float* in1, float in1_scale,
+         const float* in2, float in2_scale, float* out, float out_scale,
+         size_t dim);
+
 // NHWC/HWIO rectangular WS convolution; false means no instructions issued.
 bool SystolicConvRect(char accelerator_mode, int64_t batch,
                      int64_t input_h, int64_t input_w, int64_t input_channels,
