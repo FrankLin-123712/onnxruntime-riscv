@@ -202,7 +202,8 @@ Status Conv_nhwc<T>::Compute(OpKernelContext* context) const {
       ort_replay::Scope replay_matmul("kernel", "conv.matmul");
       if (replay_matmul.Active()) {
         replay_matmul.Detail(("layout=NHWC;M=" + std::to_string(output_image_size) +
-            ";N=" + std::to_string(M / conv_attrs_.group) + ";K=" + std::to_string(kernel_dim)).c_str());
+            ";N=" + std::to_string(M / conv_attrs_.group) + ";K=" + std::to_string(kernel_dim) +
+            ";fused_relu=" + std::to_string(fused_relu_)).c_str());
       }
       SystolicMultiply(static_cast<const SystolicExecutionProvider*>(this->Info().GetExecutionProvider())->GetAcceleratorMode(),
                        /*relu= */ fused_relu_,

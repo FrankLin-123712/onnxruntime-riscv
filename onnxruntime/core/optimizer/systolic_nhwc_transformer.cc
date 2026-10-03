@@ -52,6 +52,10 @@ class SystolicNhwcTransformerImpl {
   template <typename T, ONNX_NAMESPACE::TensorProto_DataType ONNX_T>
   void TransformConv(Node& node, const logging::Logger& logger, uint32_t weightIdx, uint32_t biasIdx);
   void TransformQLinearAdd(Node& node, const logging::Logger& logger);
+  void TransformFloatAdd(Node& node, const logging::Logger& logger);
+  bool FuseReluWithNhwcProducer(Node& node, const logging::Logger& logger);
+  bool FuseReluWithCpuAdd(Node& node, const logging::Logger& logger);
+  void TransformInstanceNormalization(Node& node, const logging::Logger& logger);
   void TransformMaxPool(Node& node, const logging::Logger& logger);
   bool FuseMaxPoolWithConv(Node& node, const logging::Logger& logger);
   void TransformPassThrough(Node& node, const logging::Logger& logger);
@@ -301,7 +305,13 @@ void SystolicNhwcTransformerImpl::TransformConv(Node& node, const logging::Logge
  * Transform for nodes that don't care about input format. E.g. relu
  */
 void SystolicNhwcTransformerImpl::TransformPassThrough(Node& node, const logging::Logger& logger) {
-  if (!ShouldTransform(node, logger)) {
+  // CPU Relu is layout independent; keep it on the CPU without transposes.
+  const auto* input_type = node.InputDefs()[0]->TypeAsProto();
+  const bool cpu_float_relu = node.OpType() == "Relu" && node.Domain() == kOnnxDomain &&
+      node.GetExecutionProviderType() == kCpuExecutionProvider && input_type &&
+      input_type->has_tensor_type() &&
+      input_type->tensor_type().elem_type() == ONNX_NAMESPACE::TensorProto_DataType_FLOAT;
+  if (!cpu_float_relu && !ShouldTransform(node, logger)) {
     return;
   }
   auto& input_defs = node.MutableInputDefs();
@@ -317,6 +327,136 @@ void SystolicNhwcTransformerImpl::TransformPassThrough(Node& node, const logging
 
     CreateNhwcArgument(node, node, output_defs[0]->Name());
   }
+}
+
+bool SystolicNhwcTransformerImpl::FuseReluWithNhwcProducer(Node& node, const logging::Logger& logger) {
+  if (pretraining_pass_ || node.Domain() != kOnnxDomain ||
+      node.GetExecutionProviderType() != kCpuExecutionProvider ||
+      node.InputDefs().size() != 1 || node.OutputDefs().size() != 1) {
+    return false;
+  }
+  const auto* type = node.InputDefs()[0]->TypeAsProto();
+  if (!type || !type->has_tensor_type() ||
+      type->tensor_type().elem_type() != ONNX_NAMESPACE::TensorProto_DataType_FLOAT) {
+    return false;
+  }
+  auto it = nhwc_args_.find(node.MutableInputDefs()[0]);
+  if (it == nhwc_args_.end()) return false;
+  auto& input = *it->second;
+  // Graph outputs count as a use too: a visible pre-activation value must not
+  // be replaced by the fused activation, even with only one consumer node.
+  if (input.starting_original_uses_ != 1 || input.remaining_original_uses_ != 1) {
+    return false;
+  }
+  auto& producer = input.output_node_;
+  if ((producer.OpType() == "Conv_nhwc" &&
+       producer.GetExecutionProviderType() == kSystolicExecutionProvider) ||
+      (producer.OpType() == "InstanceNormalization_nhwc" &&
+       producer.GetExecutionProviderType() == kCpuExecutionProvider)) {
+    producer.AddAttribute("relu", int64_t{1});
+    --input.remaining_original_uses_;
+    FuseNhwcArgument(node, input);
+  } else if (producer.OpType() == "Add" && producer.Domain() == kOnnxDomain &&
+             producer.GetExecutionProviderType() == kCpuExecutionProvider) {
+    Node& fused = graph_.AddNode(graph_.GenerateNodeName(producer.Name() + "_relu"),
+                                "AddRelu", "FP32 CPU Add with fused Relu",
+                                producer.MutableInputDefs(), producer.MutableOutputDefs(), nullptr, kOnnxDomain);
+    fused.SetExecutionProviderType(kCpuExecutionProvider);
+    // The original Add mapping has no remaining use after this activation.
+    // The Relu output mapping must refer to the new producer, which survives
+    // Finalize(), rather than the Add node queued for removal.
+    --input.remaining_original_uses_;
+    NhwcArgument fused_input(fused, input.nhwc_arg_, 1);
+    FuseNhwcArgument(node, fused_input);
+    removed_nodes_.push_front(producer.Index());
+  } else {
+    return false;
+  }
+  removed_nodes_.push_front(node.Index());
+  LOGS(logger, VERBOSE) << "Fusing FP32 Relu with NHWC " << producer.OpType();
+  return true;
+}
+
+bool SystolicNhwcTransformerImpl::FuseReluWithCpuAdd(Node& node, const logging::Logger& logger) {
+  if (pretraining_pass_ || node.Domain() != kOnnxDomain ||
+      node.GetExecutionProviderType() != kCpuExecutionProvider ||
+      node.InputDefs().size() != 1 || node.OutputDefs().size() != 1 ||
+      node.GetInputEdgesCount() != 1) return false;
+  const auto* type = node.InputDefs()[0]->TypeAsProto();
+  if (!type || !type->has_tensor_type() ||
+      type->tensor_type().elem_type() != ONNX_NAMESPACE::TensorProto_DataType_FLOAT) return false;
+  // Unmapped tensors retain ONNX's original axis order and broadcasting. Do
+  // not require NHWC for an elementwise CPU fusion.
+  if (nhwc_args_.count(node.MutableInputDefs()[0])) return false;
+  const auto& edge = *node.InputEdgesBegin();
+  auto* producer = graph_.GetNode(edge.GetNode().Index());
+  if (!producer || producer->OpType() != "Add" || producer->Domain() != kOnnxDomain ||
+      producer->GetExecutionProviderType() != kCpuExecutionProvider ||
+      producer->InputDefs().size() != 2 || producer->OutputDefs().size() != 1 ||
+      producer->GetOutputEdgesCount() != 1 ||
+      !graph_.GetNodeOutputsInGraphOutputs(*producer).empty()) return false;
+  Node& fused = graph_.AddNode(graph_.GenerateNodeName(producer->Name() + "_relu"),
+                              "AddRelu", "FP32 CPU Add with fused Relu",
+                              producer->MutableInputDefs(), node.MutableOutputDefs(), nullptr, kOnnxDomain);
+  fused.SetExecutionProviderType(kCpuExecutionProvider);
+  graph_utils::RemoveNodeOutputEdges(graph_, node);
+  graph_utils::RemoveNodeOutputEdges(graph_, *producer);
+  removed_nodes_.push_front(node.Index());
+  removed_nodes_.push_front(producer->Index());
+  LOGS(logger, VERBOSE) << "Fusing FP32 CPU Add and Relu in original layout";
+  return true;
+}
+
+void SystolicNhwcTransformerImpl::TransformInstanceNormalization(Node& node,
+                                                                const logging::Logger& logger) {
+  if (pretraining_pass_ || node.Domain() != kOnnxDomain ||
+      node.GetExecutionProviderType() != kCpuExecutionProvider ||
+      node.InputDefs().size() != 3 || node.OutputDefs().size() != 1) return;
+  for (const auto* arg : node.InputDefs()) {
+    const auto* type = arg->TypeAsProto();
+    if (!type || !type->has_tensor_type() ||
+        type->tensor_type().elem_type() != ONNX_NAMESPACE::TensorProto_DataType_FLOAT) return;
+  }
+  auto it = nhwc_args_.find(node.MutableInputDefs()[0]);
+  if (it == nhwc_args_.end()) return;
+  // NHWC provenance guarantees rank 4 even for dynamic image dimensions.
+  // Scale and bias remain per-channel vectors; only the activation changes
+  // layout. The new CPU kernel validates their runtime dimensions.
+  Node& nhwc = graph_.AddNode(graph_.GenerateNodeName(node.Name() + "_nhwc"),
+                             "InstanceNormalization_nhwc", "FP32 CPU NHWC InstanceNormalization",
+                             node.MutableInputDefs(), node.MutableOutputDefs(), &node.GetAttributes(), kOnnxDomain);
+  nhwc.SetExecutionProviderType(kCpuExecutionProvider);
+  nhwc.MutableInputDefs()[0] = it->second->nhwc_arg_;
+  --it->second->remaining_original_uses_;
+  CreateNhwcArgument(node, nhwc, node.OutputDefs()[0]->Name());
+  removed_nodes_.push_front(node.Index());
+  LOGS(logger, VERBOSE) << "Keeping FP32 InstanceNormalization in NHWC on CPU";
+}
+
+void SystolicNhwcTransformerImpl::TransformFloatAdd(Node& node, const logging::Logger& logger) {
+  if (node.Domain() != kOnnxDomain || node.GetExecutionProviderType() != kCpuExecutionProvider ||
+      node.InputDefs().size() != 2 || node.OutputDefs().size() != 1) return;
+  auto& inputs = node.MutableInputDefs();
+  auto first = nhwc_args_.find(inputs[0]);
+  auto second = nhwc_args_.find(inputs[1]);
+  if (first == nhwc_args_.end() || second == nhwc_args_.end()) return;
+  for (const auto* input : inputs) {
+    const auto* type = input->TypeAsProto();
+    if (!type || !type->has_tensor_type() ||
+        type->tensor_type().elem_type() != ONNX_NAMESPACE::TensorProto_DataType_FLOAT) return;
+  }
+  // Every mapped value originates in a 2D Conv (rank-4 weights) and travels
+  // through rank-preserving operations. Thus both operands have rank 4 even
+  // when dynamic shape inference cannot infer their dimensions. Applying the
+  // same NCHW->NHWC permutation to both operands preserves dimensionwise Add
+  // broadcasting too. Unmapped/scalar/lower-rank inputs are deliberately left
+  // in NCHW; their right-aligned broadcasting would need separate handling.
+  inputs[0] = first->second->nhwc_arg_;
+  inputs[1] = second->second->nhwc_arg_;
+  --first->second->remaining_original_uses_;
+  --second->second->remaining_original_uses_;
+  CreateNhwcArgument(node, node, node.OutputDefs()[0]->Name());
+  LOGS(logger, VERBOSE) << "Keeping rank-4 FP32 CPU Add in NHWC";
 }
 
 void SystolicNhwcTransformerImpl::TransformQLinearAdd(Node& node, const logging::Logger& logger) {
@@ -489,14 +629,22 @@ void SystolicNhwcTransformerImpl::Transform(Node& node, const logging::Logger& l
     } else {
       TransformConv<float, ONNX_NAMESPACE::TensorProto_DataType_FLOAT>(node, logger, 1, 2);
     }
+  } else if (node.OpType() == "Relu") {
+    if (!FuseReluWithNhwcProducer(node, logger) && !FuseReluWithCpuAdd(node, logger)) {
+      TransformPassThrough(node, logger);
+    }
+  } else if (node.OpType() == "InstanceNormalization") {
+    TransformInstanceNormalization(node, logger);
   } else if (node.GetInputEdgesCount() == 0 && node.InputDefs().size() != 0) {
     // The following transforms only run when the input edge count has already
     // been decremented to zero by earlier transforms. This is a hint that the
     // node may already have all inputs converted to NHWC format and is not
     // needed for correct operation. This avoids doing extra string checks for
     // nodes unrelated to this transformer.
-    if (node.OpType() == "QLinearRelu" || node.OpType() == "Relu") {
+    if (node.OpType() == "QLinearRelu") {
       TransformPassThrough(node, logger);
+    } else if (node.OpType() == "Add") {
+      TransformFloatAdd(node, logger);
     } else if (node.OpType() == "QLinearAdd") {
       TransformQLinearAdd(node, logger);
     } else if (node.OpType() == "MaxPool") {

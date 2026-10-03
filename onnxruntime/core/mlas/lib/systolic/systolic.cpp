@@ -169,7 +169,8 @@ bool SystolicConvRect(char accelerator_mode, int64_t batch,
     const std::string detail = "path=direct_conv;layout=NHWC;abi=rect_v1;tiling=capacity_v2;tile=" +
         std::to_string(tile.rows) + "x" + std::to_string(tile.cols) + "x" +
         std::to_string(tile.ci) + "x" + std::to_string(tile.co) +
-        ";loops=" + std::to_string(static_cast<uint64_t>(systolic_rect::LoopCount(s, tile)));
+        ";loops=" + std::to_string(static_cast<uint64_t>(systolic_rect::LoopCount(s, tile))) +
+        ";fused_relu=" + std::to_string(relu);
     profile.Detail(detail.c_str());
   }
   gemmini_extended_config_st(output_channels * sizeof(float), relu, output_scale);

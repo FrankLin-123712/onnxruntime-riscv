@@ -29,6 +29,7 @@ template <typename T>
 class Conv_nhwc : public OpKernel {
  public:
   Conv_nhwc(const OpKernelInfo& info) : OpKernel(info), conv_attrs_(info) {
+    fused_relu_ = info.GetAttrOrDefault<int64_t>("relu", 0) != 0;
   }
 
   Status Compute(OpKernelContext* context) const override;

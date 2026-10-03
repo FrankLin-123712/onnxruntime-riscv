@@ -334,6 +334,57 @@ void RegisterSystolicSchemas() {
   RegisterSystolicTrainingSchemas();
 #endif
 
+#ifdef USE_SYSTOLIC
+  // Internal CPU kernels used to retain Systolic NHWC buffers and combine
+  // adjacent elementwise operations. Neither operator offloads to Gemmini.
+  ONNX_SYSTOLIC_OPERATOR_SCHEMA(AddRelu)
+      .SinceVersion(1)
+      .SetDoc("Internal FP32 CPU Add followed by Relu, with multidirectional broadcasting.")
+      .Input(0, "A", "", "T")
+      .Input(1, "B", "", "T")
+      .Output(0, "C", "", "T")
+      .TypeConstraint("T", {"tensor(float)"}, "")
+      .TypeAndShapeInferenceFunction([](InferenceContext& ctx) {
+        ONNX_NAMESPACE::propagateElemTypeFromInputToOutput(ctx, 0, 0);
+        if (ONNX_NAMESPACE::hasNInputShapes(ctx, 2)) {
+          ONNX_NAMESPACE::bidirectionalBroadcastShapeInference(
+              ONNX_NAMESPACE::getInputShape(ctx, 0), ONNX_NAMESPACE::getInputShape(ctx, 1),
+              *ctx.getOutputType(0)->mutable_tensor_type()->mutable_shape());
+        }
+      });
+
+  ONNX_SYSTOLIC_OPERATOR_SCHEMA(InstanceNormalization_nhwc)
+      .SinceVersion(1)
+      .SetDoc("Internal FP32 CPU instance normalization for rank-4 NHWC input, with optional Relu.")
+      .Input(0, "X", "NHWC input", "T")
+      .Input(1, "scale", "Per-channel scale", "T")
+      .Input(2, "B", "Per-channel bias", "T")
+      .Output(0, "Y", "NHWC output", "T")
+      .TypeConstraint("T", {"tensor(float)"}, "")
+      .Attr("epsilon", "", AttributeProto::FLOAT, 1e-5f)
+      .Attr("relu", "", AttributeProto::INT, static_cast<int64_t>(0))
+      .TypeAndShapeInferenceFunction([](InferenceContext& ctx) {
+        ONNX_NAMESPACE::propagateShapeAndTypeFromFirstInput(ctx);
+        if (ONNX_NAMESPACE::hasInputShape(ctx, 0)) {
+          const auto& shape = ONNX_NAMESPACE::getInputShape(ctx, 0);
+          if (shape.dim_size() != 4) {
+            fail_shape_inference("InstanceNormalization_nhwc requires rank 4");
+          }
+          for (size_t index : {size_t{1}, size_t{2}}) {
+            if (!ONNX_NAMESPACE::hasInputShape(ctx, index)) continue;
+            const auto& parameter = ONNX_NAMESPACE::getInputShape(ctx, index);
+            if (parameter.dim_size() != 1) {
+              fail_shape_inference("InstanceNormalization_nhwc parameters require rank 1");
+            }
+            if (shape.dim(3).has_dim_value() && parameter.dim(0).has_dim_value() &&
+                shape.dim(3).dim_value() != parameter.dim(0).dim_value()) {
+              fail_shape_inference("InstanceNormalization_nhwc channel count mismatch");
+            }
+          }
+        }
+      });
+#endif  // USE_SYSTOLIC
+
   ONNX_SYSTOLIC_OPERATOR_SCHEMA(QLinearRelu)
       .SinceVersion(1)
       .SetDoc("A Relu that works on int8")
