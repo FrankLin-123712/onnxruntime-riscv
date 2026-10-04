@@ -353,7 +353,8 @@ bool SystolicNhwcTransformerImpl::FuseReluWithNhwcProducer(Node& node, const log
   if ((producer.OpType() == "Conv_nhwc" &&
        producer.GetExecutionProviderType() == kSystolicExecutionProvider) ||
       (producer.OpType() == "InstanceNormalization_nhwc" &&
-       producer.GetExecutionProviderType() == kCpuExecutionProvider)) {
+       (producer.GetExecutionProviderType() == kCpuExecutionProvider ||
+        producer.GetExecutionProviderType() == kSystolicExecutionProvider))) {
     producer.AddAttribute("relu", int64_t{1});
     --input.remaining_original_uses_;
     FuseNhwcArgument(node, input);
@@ -424,16 +425,21 @@ void SystolicNhwcTransformerImpl::TransformInstanceNormalization(Node& node,
   if (it == nhwc_args_.end()) return;
   // NHWC provenance guarantees rank 4 even for dynamic image dimensions.
   // Scale and bias remain per-channel vectors; only the activation changes
-  // layout. The new CPU kernel validates their runtime dimensions.
+  // layout. Both kernels validate their runtime dimensions.
   Node& nhwc = graph_.AddNode(graph_.GenerateNodeName(node.Name() + "_nhwc"),
-                             "InstanceNormalization_nhwc", "FP32 CPU NHWC InstanceNormalization",
+                             "InstanceNormalization_nhwc", "FP32 NHWC InstanceNormalization",
                              node.MutableInputDefs(), node.MutableOutputDefs(), &node.GetAttributes(), kOnnxDomain);
+#if defined(SYSTOLIC_FP32) && defined(GEMMINI_NHWC_NORM)
+  nhwc.SetExecutionProviderType(kSystolicExecutionProvider);
+#else
   nhwc.SetExecutionProviderType(kCpuExecutionProvider);
+#endif
   nhwc.MutableInputDefs()[0] = it->second->nhwc_arg_;
   --it->second->remaining_original_uses_;
   CreateNhwcArgument(node, nhwc, node.OutputDefs()[0]->Name());
   removed_nodes_.push_front(node.Index());
-  LOGS(logger, VERBOSE) << "Keeping FP32 InstanceNormalization in NHWC on CPU";
+  LOGS(logger, VERBOSE) << "Keeping FP32 InstanceNormalization in NHWC on "
+                      << nhwc.GetExecutionProviderType();
 }
 
 void SystolicNhwcTransformerImpl::TransformFloatAdd(Node& node, const logging::Logger& logger) {

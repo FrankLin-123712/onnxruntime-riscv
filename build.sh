@@ -15,6 +15,7 @@ for arg in "$@"; do
     --help|-h)
       echo "Usage: ./build.sh --config=Debug|Release --systolic_fp16|--systolic_fp32 [--for_firesim] [--parallel=N]"
       echo "Default: Debug, FP32, Spike (FOR_FIRESIM=OFF). FP16 CPU code requires Zfh."
+      echo "--systolic_nhwc_norm opts into FP32 NHWC InstanceNorm (requires its matching hardware/plugin)."
       echo "Outputs: FP32 build/<config>; FP16 build/fp16-riscv/<config>."
       echo "Compiler: Chipyard .conda-env/riscv-tools (fixed for RISC-V builds)."
       echo "Other ORT options: python3 tools/ci_build/build.py --help"

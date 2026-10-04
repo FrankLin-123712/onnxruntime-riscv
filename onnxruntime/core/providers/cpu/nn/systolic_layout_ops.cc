@@ -6,6 +6,7 @@
 // issue accelerator instructions.
 #ifdef USE_SYSTOLIC
 #include "core/providers/cpu/math/element_wise_ops.h"
+#include "core/providers/cpu/nn/instance_norm_nhwc.h"
 
 #include <cmath>
 
@@ -67,58 +68,12 @@ class InstanceNormNhwc final : public OpKernel {
 
     const int64_t batches = shape.GetDims()[0];
     const int64_t spatial = shape.Slice(1, 3).Size();
-    const int64_t sample_size = shape.SizeFromDimension(1);
-    const float* scale_data = scale->Data<float>();
-    const float* bias_data = bias->Data<float>();
-
-    // Only O(C) temporary storage. Visit channels contiguously in NHWC for
-    // each spatial position, retaining the spatial accumulation order of the
-    // existing scalar NCHW kernel for each individual channel. In particular,
-    // variance uses centered differences, not E[x*x] - E[x]*E[x].
     AllocatorPtr allocator;
     ORT_RETURN_IF_ERROR(context->GetTempSpaceAllocator(&allocator));
     Tensor workspace(DataTypeImpl::GetType<float>(), TensorShape({3, channels}), allocator);
-    float* mean = workspace.MutableData<float>();
-    float* variance_and_scale = mean + channels;
-    float* shift = variance_and_scale + channels;
-    for (int64_t n = 0; n < batches; ++n) {
-      const float* x = input->Data<float>() + n * sample_size;
-      float* y = output->MutableData<float>() + n * sample_size;
-      for (int64_t c = 0; c < channels; ++c) mean[c] = x[c];
-      for (int64_t s = 1; s < spatial; ++s) {
-        const float* row = x + s * channels;
-        for (int64_t c = 0; c < channels; ++c) mean[c] += row[c];
-      }
-      for (int64_t c = 0; c < channels; ++c) {
-        mean[c] /= static_cast<float>(spatial);
-        const float delta = x[c] - mean[c];
-        variance_and_scale[c] = delta * delta;
-      }
-      for (int64_t s = 1; s < spatial; ++s) {
-        const float* row = x + s * channels;
-        for (int64_t c = 0; c < channels; ++c) {
-          const float delta = row[c] - mean[c];
-          variance_and_scale[c] += delta * delta;
-        }
-      }
-      for (int64_t c = 0; c < channels; ++c) {
-        const float inv_stdev = 1.0f / std::sqrt(
-            variance_and_scale[c] / static_cast<float>(spatial) + epsilon_);
-        variance_and_scale[c] = inv_stdev * scale_data[c];
-        shift[c] = bias_data[c] - mean[c] * variance_and_scale[c];
-      }
-      const ConstEigenVectorArrayMap<float> channel_scale(variance_and_scale, channels);
-      const ConstEigenVectorArrayMap<float> channel_shift(shift, channels);
-      for (int64_t s = 0; s < spatial; ++s) {
-        const ConstEigenVectorArrayMap<float> xi(x + s * channels, channels);
-        EigenVectorArrayMap<float> yi(y + s * channels, channels);
-        if (relu_) {
-          yi = (xi * channel_scale + channel_shift).cwiseMax(0.0f);
-        } else {
-          yi = xi * channel_scale + channel_shift;
-        }
-      }
-    }
+    InstanceNormNhwcCpu(input->Data<float>(), scale->Data<float>(), bias->Data<float>(),
+                        output->MutableData<float>(), batches, spatial, channels,
+                        epsilon_, relu_, workspace.MutableData<float>());
     return Status::OK();
   }
 

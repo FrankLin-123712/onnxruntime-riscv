@@ -153,6 +153,7 @@ void SystolicFlush() {
 
 #ifdef SYSTOLIC_FP32
 #include "conv_rect.h"
+#include "gemmini_nhwc_norm.h"
 
 namespace {
 struct PointwiseTile { size_t co, spatial, ci; };  // Counts of DIM-sized blocks.
@@ -541,6 +542,37 @@ void SystolicMultiply(char accelerator_mode, bool relu,
  * Adds two matrices elementwise
  */
 #ifdef SYSTOLIC_FP32
+bool SystolicInstanceNormNhwc(char accelerator_mode, const float* input,
+                             const float* gamma, const float* beta, float* output,
+                             size_t batches, size_t spatial, size_t channels,
+                             float epsilon, bool relu, float* workspace,
+                             size_t workspace_floats) {
+  // Initial ORT dispatch is restricted to patchify's channel widths. The
+  // low-level ABI also handles partial lanes for its boundary tests.
+  if (accelerator_mode != 2 || (channels != 32 && channels != 64)) return false;
+#if defined(GEMMINI_NHWC_NORM_HELPER_ENABLED)
+  if (!input || !gamma || !beta || !output || !workspace ||
+      !std::isfinite(epsilon) || epsilon <= 0.0f ||
+      workspace_floats < 3 * channels || spatial > UINT32_MAX ||
+      (spatial && batches > SIZE_MAX / spatial / channels / sizeof(float))) return false;
+  ort_replay::Scope profile("kernel", "instance_norm.nhwc_hw",
+                            "InstanceNormalization_nhwc", "SystolicExecutionProvider");
+  if (profile.Active()) {
+    const std::string detail = "abi=nhwc_norm_v1;dtype=fp32;execution=2;passes=3;finishing=cpu;N=" +
+        std::to_string(batches) + ";S=" + std::to_string(spatial) +
+        ";C=" + std::to_string(channels) + ";fused_relu=" + std::to_string(relu);
+    profile.Detail(detail.c_str());
+  }
+  return gemmini_nhwc_instance_norm(input, gamma, beta, output, batches, spatial,
+                                    channels, epsilon, relu, workspace, workspace_floats);
+#else
+  (void)input; (void)gamma; (void)beta; (void)output;
+  (void)batches; (void)spatial; (void)epsilon; (void)relu;
+  (void)workspace; (void)workspace_floats;
+  return false;
+#endif
+}
+
 void SystolicAdd(char accelerator_mode, bool relu, const float* A, float A_scale,
                  const float* B, float B_scale, float* C, float C_scale, size_t dim) {
   if (dim == 0) return;

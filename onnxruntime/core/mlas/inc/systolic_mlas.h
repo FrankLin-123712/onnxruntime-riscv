@@ -62,6 +62,16 @@ MLASCALL(char accelerator_mode, int batch_size, int in_dim, int in_channels,
 
 #ifdef SYSTOLIC_FP32
 
+// Three-pass NHWC InstanceNorm: accelerator reductions/affine, CPU O(C)
+// statistics finishing. Requires the opt-in NHWC normalization hardware ABI.
+// False leaves output unchanged and issues no accelerator instructions.
+// Workspace holds at least 3*channels floats; buffers must not overlap.
+bool SystolicInstanceNormNhwc(char accelerator_mode, const float* input,
+                             const float* gamma, const float* beta, float* output,
+                             size_t batches, size_t spatial, size_t channels,
+                             float epsilon, bool relu, float* workspace,
+                             size_t workspace_floats);
+
 // Group-1, stride-1, unpadded 1x1 Conv: NHWC input, original OIHW weights,
 // and NCHW output. Mode 2 uses WS W * X^T; modes 0/1 are CPU references.
 // False means unsupported dimensions/mode/buffers, with no output writes or

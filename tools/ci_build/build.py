@@ -412,6 +412,8 @@ def parse_arguments():
                            help="FP16 Gemmini kernels (RISC-V CPU requires Zfh)")
     precision.add_argument("--systolic_fp32", action="store_true",
                            help="FP32 Gemmini kernels (default)")
+    parser.add_argument("--systolic_nhwc_norm", action="store_true",
+                        help="Enable FP32 NHWC InstanceNorm ABI; requires matching new hardware/Spike plugin")
     parser.add_argument(
         "--for_firesim", action='store_true', help="Build for Firesim & disable debug print")
     parser.add_argument(
@@ -676,6 +678,7 @@ def generate_build_tree(cmake_path, source_dir, build_dir, cuda_home, cudnn_home
         "-Donnxruntime_SYSTOLIC_FP16=" + ("ON" if args.systolic_fp16 else "OFF"),
         "-Donnxruntime_SYSTOLIC_FP32=" + ("OFF" if args.systolic_fp16 else "ON"),
         "-Donnxruntime_SYSTOLIC_INT8=OFF",
+        "-Donnxruntime_SYSTOLIC_NHWC_NORM=" + ("ON" if args.systolic_nhwc_norm else "OFF"),
         "-Donnxruntime_FOR_FIRESIM=" + ("ON" if args.for_firesim else "OFF"),
         "-Donnxruntime_USE_HWACHA=" + ("ON" if args.use_hwacha else "OFF"),
         "-Donnxruntime_RUN_ONNX_TESTS=" + ("ON" if args.enable_onnx_tests else "OFF"),
