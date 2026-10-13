@@ -1,3 +1,5 @@
+#include <limits>
+
 #ifdef SYSTOLIC_FP16
 // FP16 implementation shared by ORT and standalone replay binaries.
 #include "core/mlas/inc/systolic_mlas.h"
@@ -5,7 +7,6 @@
 #include "core/common/replay_profile.h"
 #include <algorithm>
 #include <cmath>
-#include <limits>
 #include <stdexcept>
 #include <string>
 #include "conv_rect.h"
@@ -138,7 +139,8 @@ void SystolicFlush() {
 #include "core/common/replay_profile.h"
 #ifdef SYSTOLIC_FP32
 #include <algorithm>
-#include <limits>
+#include <numeric>
+#include <sstream>
 #include <vector>
 #include "core/mlas/inc/mlas.h"
 #endif
@@ -875,3 +877,267 @@ void DotPreloaded(float* output) {
 }
 }  // namespace systolic_corr
 #endif
+
+// SAG1 SoftAggResidual executor. The entry point is available in every
+// precision build; nonempty inputs require an explicitly enabled FP32 engine.
+namespace {
+namespace softagg {
+void Require(bool condition, const char* message) {
+  if (!condition) throw std::invalid_argument(message);
+}
+
+#if defined(__riscv) && defined(SYSTOLIC_FP32) && !defined(SYSTOLIC_FP16)
+static_assert(DIM == 16 && BANK_NUM * BANK_ROWS == 4096 && ACC_ROWS == 1024 &&
+                  sizeof(elem_t) == 4 && sizeof(acc_t) == 4,
+              "SoftAgg SAG1 requires FP32 DIM16 SP256KiB/ACC64KiB");
+constexpr uint32_t kChannels = 384;
+constexpr uint32_t kAcc = UINT32_C(0x80000000);
+constexpr uint32_t kAccumulate = UINT32_C(0x40000000);
+constexpr uint32_t kBiasS = 3840;
+constexpr uint32_t kBiasV = 3856;
+constexpr uint32_t kXRow = 3872;
+constexpr uint32_t kOutputRow = 3873;
+constexpr uint64_t kMagic = UINT64_C(0x5341473100000000);
+
+struct Traffic {
+  uint64_t weights = 0, bias = 0, x = 0, y_read = 0, y_write = 0, output = 0;
+  uint64_t commands = 0, dma_commands = 0, dma_lines = 0;
+  void Dma(const void* address, uint32_t rows, uint32_t columns) {
+    ++commands;
+    ++dma_commands;
+    // 64B address spans, not measured TileLink requests/cache misses. Stride
+    // is 384 floats, so all rows have the same cache-line alignment.
+    dma_lines += rows * ((reinterpret_cast<uintptr_t>(address) % 64 + columns * 4 + 63) / 64);
+  }
+};
+
+// Compiler ordering is required in addition to the Rocket/Gemmini fence.
+void Fence() { asm volatile("fence" ::: "memory"); }
+uint64_t Status(uint64_t selector = 0) {
+  uint64_t result;
+  ROCC_INSTRUCTION(XCUSTOM_ACC, result, selector, 0, 47);
+  return result;
+}
+void CheckEngine() {
+  const uint64_t status = Status();
+  Require((status & UINT64_C(0xffffffff00000004)) == (kMagic | 4),
+          "SoftAgg C requires the enabled SAG1 local hardware engine");
+  Require(!(status & 1), "SoftAgg local engine reported an error");
+}
+void RunGroup(uint32_t s, uint32_t v, uint32_t bias_s, uint32_t bias_v,
+              uint32_t count, bool residual, Traffic& traffic) {
+  const uint64_t biases = (uint64_t(bias_v) << 32) | bias_s;
+  const uint64_t strides = (UINT64_C(1) << 32) | (residual ? 0 : 1);
+  ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, biases, strides, 45);
+  const uint64_t sources = (uint64_t(v) << 32) | s;
+  const uint64_t destination = (uint64_t(kOutputRow) << 32) |
+      (uint64_t(count) << 16) | (UINT64_C(16) << 8) | (residual ? 1 : 0);
+  ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, sources, destination, 46);
+  traffic.commands += 2;
+  // The engine owns local ports exclusively. Completion precedes reuse of S,
+  // the output staging row, and any ordinary DMA/execute command.
+  uint64_t status;
+  do { status = Status(); ++traffic.commands; } while (status & 2);
+  Require(!(status & 1), "SoftAgg local operation failed");
+}
+
+// SP matrices use Gemmini's native tile-row layout. No CPU packing is needed.
+void LoadWeights(const float* weights, uint32_t base, uint32_t column,
+                 uint32_t panel, Traffic& traffic) {
+  for (uint32_t k = 0; k < kChannels / DIM; ++k)
+    for (uint32_t j = 0; j < panel / DIM; ++j) {
+      const uint32_t address = base + (k * (panel / DIM) + j) * DIM;
+      gemmini_extended_mvin(weights + k * DIM * kChannels + column + j * DIM,
+                            address, DIM, DIM);
+      traffic.weights += DIM * DIM * sizeof(float);
+      traffic.Dma(weights + k * DIM * kChannels + column + j * DIM, DIM, DIM);
+    }
+}
+void LoadBias(const float* bias, uint32_t base, uint32_t column, uint32_t panel, Traffic& traffic) {
+  for (uint32_t j = 0; j < panel / DIM; ++j) {
+    gemmini_extended_mvin(bias + column + j * DIM, base + j, DIM, 1);
+    traffic.bias += DIM * sizeof(float);
+    traffic.Dma(bias + column + j * DIM, 1, DIM);
+  }
+}
+void LoadIndexedRows(const float* x, const std::vector<size_t>& edge_ids,
+                     size_t begin, size_t end, uint32_t base, Traffic& traffic) {
+  for (size_t i = begin; i < end; ++i) {
+    const uint32_t row = static_cast<uint32_t>(i - begin);
+    for (uint32_t k = 0; k < kChannels / DIM; ++k) {
+      const uint32_t address = base + ((row / DIM) * (kChannels / DIM) + k) * DIM + row % DIM;
+      gemmini_extended_mvin(x + edge_ids[i] * kChannels + k * DIM, address, DIM, 1);
+      traffic.x += DIM * sizeof(float);
+      traffic.Dma(x + edge_ids[i] * kChannels + k * DIM, 1, DIM);
+    }
+  }
+}
+void LoadGroupRows(const float* y, size_t begin, uint32_t count, uint32_t base, Traffic& traffic) {
+  for (uint32_t i = 0; i < count; i += DIM)
+    for (uint32_t k = 0; k < kChannels / DIM; ++k) {
+      const uint32_t address = base + ((i / DIM) * (kChannels / DIM) + k) * DIM;
+      gemmini_extended_mvin(y + (begin + i) * kChannels + k * DIM,
+                            address, DIM, std::min<uint32_t>(DIM, count - i));
+      const uint32_t valid = std::min<uint32_t>(DIM, count - i);
+      traffic.y_read += valid * DIM * sizeof(float);
+      traffic.Dma(y + (begin + i) * kChannels + k * DIM, valid, DIM);
+    }
+}
+
+// Explicit local GEMM avoids LoopMatmul's private half-SP allocator and leaves
+// its slot state untouched for subsequent ORT kernels. K order and 16-term PE
+// partials match WS MatMul. First K block overwrites ACC, later blocks add.
+// ACC is channel-block-major so an entire group is contiguous across row tiles.
+void MatmulLocal(uint32_t a, uint32_t weights, uint32_t acc,
+                 uint32_t rows, uint32_t panel, uint32_t row_pitch, Traffic& traffic) {
+  for (uint32_t k = 0; k < kChannels / DIM; ++k)
+    for (uint32_t j = 0; j < panel / DIM; ++j)
+      for (uint32_t i = 0; i < rows; i += DIM) {
+        const uint32_t valid = std::min<uint32_t>(DIM, rows - i);
+        const uint32_t weight = i == 0 ? weights + (k * (panel / DIM) + j) * DIM : GARBAGE_ADDR;
+        const uint32_t result = kAcc | (k ? kAccumulate : 0) | (acc + j * row_pitch + i);
+        const uint32_t input = a + ((i / DIM) * (kChannels / DIM) + k) * DIM;
+        gemmini_extended_preload(weight, result, DIM, DIM, DIM, valid);
+        if (i == 0) {
+          gemmini_extended_compute_preloaded(input, GARBAGE_ADDR, DIM, valid, DIM, DIM);
+        } else {
+          gemmini_extended_compute_accumulated(input, GARBAGE_ADDR, DIM, valid, DIM, DIM);
+        }
+        traffic.commands += 2;
+      }
+}
+#endif
+}  // namespace softagg
+}  // namespace
+
+void SystolicSoftAggResidual(const float* x, const int64_t* q,
+                            size_t batches, size_t edges, size_t channels, size_t groups,
+                            const float* wg, const float* bg,
+                            const float* wf, const float* bf,
+                            const float* wh, const float* bh, float* output) {
+  using namespace softagg;
+  Require(batches > 0 && channels == 384 && groups <= edges,
+          "SoftAgg C expects B>=1, C=384, G<=E");
+  constexpr size_t limit = std::numeric_limits<size_t>::max() / sizeof(float);
+  Require(edges <= limit / channels && (edges == 0 || batches <= limit / (edges * channels)),
+          "SoftAgg C tensor size overflow");
+  if (edges == 0) return;
+  Require(x && q && wg && bg && wf && bf && wh && bh && output && x != output,
+          "SoftAgg C requires separate input/output and nonnull tensors");
+#if defined(__riscv) && defined(SYSTOLIC_FP32) && !defined(SYSTOLIC_FP16)
+  ort_replay::Scope profile("kernel", "softagg.onchip", "SoftAggResidual", "Gemmini");
+  Traffic traffic;
+  std::vector<size_t> offsets(groups + 1, 0);
+  for (size_t e = 0; e < edges; ++e) {
+    Require(q[e] >= 0 && static_cast<uint64_t>(q[e]) < groups,
+            "SoftAgg C index is outside the Unique inverse range");
+    ++offsets[static_cast<size_t>(q[e]) + 1];
+  }
+  std::partial_sum(offsets.begin(), offsets.end(), offsets.begin());
+  std::vector<size_t> cursors(offsets.begin(), offsets.end() - 1);
+  std::vector<size_t> edge_ids(edges);
+  for (size_t e = 0; e < edges; ++e) edge_ids[cursors[static_cast<size_t>(q[e])]++] = e;
+  size_t max_group = 0;
+  for (size_t g = 0; g < groups; ++g) max_group = std::max(max_group, offsets[g + 1] - offsets[g]);
+  Require(max_group <= 128, "SoftAgg C supports complete groups of at most 128 edges");
+  // All four plans occupy <=240KiB SP; final16KiB includes bias/staging.
+  const uint32_t tile_rows = max_group <= 32 ? 32 : max_group <= 64 ? 64 : max_group <= 96 ? 96 : 128;
+  const uint32_t panel = tile_rows == 32 ? 64 : tile_rows == 64 ? 48 : tile_rows == 96 ? 32 : 16;
+  const uint32_t weight_rows = kChannels * panel / DIM;
+  const uint32_t x_base = 2 * weight_rows;
+  Require(x_base + tile_rows * kChannels / DIM <= kBiasS && tile_rows * panel / DIM <= 512,
+          "SoftAgg C invalid local tile allocation");
+  // MLAS uses C++14, whose vector allocator need not honor alignas(64).
+  // Keep real float objects and reserve one extra cache line for alignment.
+  std::vector<float> y_storage(groups * channels + 16);
+  const size_t y_offset = (64 - reinterpret_cast<uintptr_t>(y_storage.data()) % 64) % 64;
+  float* const y = y_storage.data() + y_offset / sizeof(float);
+
+  Fence();
+  CheckEngine();
+  uint64_t engine_before[3] = {};
+  if (profile.Active()) for (uint64_t i = 0; i < 3; ++i) engine_before[i] = Status(i + 1);
+  gemmini_extended_config_ex(WEIGHT_STATIONARY, NO_ACTIVATION, 0, 0, 1, false, false);
+  gemmini_config_ld(kChannels * sizeof(float));
+  gemmini_config_st(kChannels * sizeof(float));
+  traffic.commands = 5;  // Capability check, two EX configs, LD config, ST config.
+  for (size_t b = 0; b < batches; ++b) {
+    const float* input = x + b * edges * channels;
+    float* result = output + b * edges * channels;
+    for (uint32_t c = 0; c < kChannels; c += panel) {
+      LoadWeights(wg, 0, c, panel, traffic);
+      LoadWeights(wf, weight_rows, c, panel, traffic);
+      LoadBias(bg, kBiasS, c, panel, traffic);
+      LoadBias(bf, kBiasV, c, panel, traffic);
+      for (size_t first = 0; first < groups;) {
+        size_t last = first;
+        while (last < groups && offsets[last + 1] - offsets[first] <= tile_rows) ++last;
+        const uint32_t count = static_cast<uint32_t>(offsets[last] - offsets[first]);
+        if (count) {
+          LoadIndexedRows(input, edge_ids, offsets[first], offsets[last], x_base, traffic);
+          MatmulLocal(x_base, 0, 0, count, panel, tile_rows, traffic);
+          MatmulLocal(x_base, weight_rows, 512, count, panel, tile_rows, traffic);
+          for (size_t g = first; g < last; ++g) {
+            const uint32_t n = static_cast<uint32_t>(offsets[g + 1] - offsets[g]);
+            if (!n) continue;
+            const uint32_t row = static_cast<uint32_t>(offsets[g] - offsets[first]);
+            for (uint32_t j = 0; j < panel / DIM; ++j) {
+              RunGroup(kAcc | (j * tile_rows + row), kAcc | (512 + j * tile_rows + row),
+                       kBiasS + j, kBiasV + j, n, false, traffic);
+              gemmini_extended_mvout(y + g * channels + c + j * DIM, kOutputRow, DIM, 1);
+              traffic.y_write += DIM * sizeof(float);
+              traffic.Dma(y + g * channels + c + j * DIM, 1, DIM);
+            }
+          }
+        }
+        first = last;
+      }
+    }
+    // Y is the single intentional group-sized spill. H never leaves ACC.
+    Fence();
+    constexpr uint32_t h_panel = 128, h_rows = 32;
+    constexpr uint32_t h_weight_rows = kChannels * h_panel / DIM;
+    for (uint32_t c = 0; c < kChannels; c += h_panel) {
+      LoadWeights(wh, 0, c, h_panel, traffic);
+      LoadBias(bh, kBiasS, c, h_panel, traffic);
+      for (size_t first = 0; first < groups; first += h_rows) {
+        const uint32_t count = static_cast<uint32_t>(std::min<size_t>(h_rows, groups - first));
+        LoadGroupRows(y, first, count, h_weight_rows, traffic);
+        MatmulLocal(h_weight_rows, 0, 0, count, h_panel, h_rows, traffic);
+        for (uint32_t g = 0; g < count; ++g)
+          for (size_t member = offsets[first + g]; member < offsets[first + g + 1]; ++member) {
+            const size_t e = edge_ids[member];
+            for (uint32_t j = 0; j < h_panel / DIM; ++j) {
+              gemmini_extended_mvin(input + e * channels + c + j * DIM, kXRow, DIM, 1);
+              traffic.x += DIM * sizeof(float);
+              traffic.Dma(input + e * channels + c + j * DIM, 1, DIM);
+              RunGroup(kAcc | (j * h_rows + g), kXRow, kBiasS + j, kBiasV, 1, true, traffic);
+              gemmini_extended_mvout(result + e * channels + c + j * DIM, kOutputRow, DIM, 1);
+              traffic.output += DIM * sizeof(float);
+              traffic.Dma(result + e * channels + c + j * DIM, 1, DIM);
+            }
+          }
+      }
+    }
+    Fence();
+  }
+  CheckEngine();
+  ++traffic.commands;
+  if (profile.Active()) {
+    std::ostringstream detail;
+    detail << "abi=SAG1;order=panel;B=" << batches << ";E=" << edges << ";G=" << groups
+           << ";T=" << tile_rows << ";O=" << panel << ";hT=32;hO=128"
+           << ";weight_read_bytes=" << traffic.weights << ";bias_read_bytes=" << traffic.bias
+           << ";x_read_bytes=" << traffic.x << ";y_read_bytes=" << traffic.y_read
+           << ";y_write_bytes=" << traffic.y_write << ";output_write_bytes=" << traffic.output
+           << ";rocc_commands=" << traffic.commands << ";dma_commands=" << traffic.dma_commands
+           << ";dma_64b_address_spans=" << traffic.dma_lines;
+    for (uint64_t i = 0; i < 3; ++i)
+      detail << (i == 0 ? ";engine_commands=" : i == 1 ? ";engine_read_rows=" : ";engine_write_rows=")
+             << Status(i + 1) - engine_before[i];
+    profile.Detail(detail.str().c_str());
+  }
+#else
+  throw std::runtime_error("SoftAgg C requires a RISC-V FP32 build and SAG1 hardware");
+#endif
+}

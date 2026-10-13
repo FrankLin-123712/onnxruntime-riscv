@@ -22,6 +22,17 @@ bool SystolicHalfConvRect(char mode, int64_t batch,
 #endif
 void SystolicFlush();
 
+// Opt-in FP32 DIM16 SoftAggResidual: X/output[B,E,384], shared Unique inverse
+// q[E] in [0,G), weights[384,384], biases[384]. Output must be separate from X.
+// Preserves edge order within each group. Requires groups of at most 128 edges
+// and enabled SAG1 local hardware. Empty E is a no-op after shape validation;
+// unsupported nonempty builds/shapes throw, with no CPU fallback.
+void SystolicSoftAggResidual(const float* x, const int64_t* q,
+                            size_t batches, size_t edges, size_t channels, size_t groups,
+                            const float* wg, const float* bg,
+                            const float* wf, const float* bf,
+                            const float* wh, const float* bh, float* output);
+
 #ifdef SYSTOLIC_INT8
 
 void SystolicMultiply
