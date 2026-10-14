@@ -4,6 +4,9 @@
 #include "core/providers/cpu/cpu_execution_provider.h"
 #include "core/framework/op_kernel.h"
 #include "core/framework/kernel_registry.h"
+#ifdef USE_SYSTOLIC
+#include "core/providers/cpu/nn/dpvo_ops.h"
+#endif
 
 #ifndef DISABLE_CONTRIB_OPS
 #include "contrib_ops/cpu/cpu_contrib_kernels.h"
@@ -30,6 +33,8 @@ namespace onnxruntime {
 
 // Forward declarations of op kernels
 #ifdef USE_SYSTOLIC
+class ONNX_OPERATOR_KERNEL_CLASS_NAME(kCpuExecutionProvider, kDpvoDomain, 1, softagg_onchip);
+class ONNX_OPERATOR_KERNEL_CLASS_NAME(kCpuExecutionProvider, kDpvoDomain, 1, correlation_batch);
 class ONNX_OPERATOR_KERNEL_CLASS_NAME(kCpuExecutionProvider, kOnnxDomain, 1, AddRelu);
 class ONNX_OPERATOR_KERNEL_CLASS_NAME(kCpuExecutionProvider, kOnnxDomain, 1, InstanceNormalization_nhwc);
 #endif
@@ -899,6 +904,8 @@ Status RegisterOnnxOperatorKernels(KernelRegistry& kernel_registry) {
       BuildKernelCreateInfo<ONNX_OPERATOR_KERNEL_CLASS_NAME(kCpuExecutionProvider, kOnnxDomain, 6,
                                                             InstanceNormalization)>,
 #ifdef USE_SYSTOLIC
+      BuildKernelCreateInfo<ONNX_OPERATOR_KERNEL_CLASS_NAME(kCpuExecutionProvider, kDpvoDomain, 1, softagg_onchip)>,
+      BuildKernelCreateInfo<ONNX_OPERATOR_KERNEL_CLASS_NAME(kCpuExecutionProvider, kDpvoDomain, 1, correlation_batch)>,
       BuildKernelCreateInfo<ONNX_OPERATOR_KERNEL_CLASS_NAME(kCpuExecutionProvider, kOnnxDomain, 1, AddRelu)>,
       BuildKernelCreateInfo<ONNX_OPERATOR_KERNEL_CLASS_NAME(kCpuExecutionProvider, kOnnxDomain, 1, InstanceNormalization_nhwc)>,
 #endif

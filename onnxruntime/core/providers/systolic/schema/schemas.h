@@ -335,6 +335,46 @@ void RegisterSystolicSchemas() {
 #endif
 
 #ifdef USE_SYSTOLIC
+  ONNX_NAMESPACE::OpSchemaRegistry::DomainToVersionRange::Instance().AddDomainToVersion("dpvo", 1, 1);
+  ONNX_SYSTOLIC_OPERATOR_SCHEMA(softagg_onchip)
+      .SetDomain("dpvo")
+      .SinceVersion(1)
+      .SetDoc("DPVO SoftAgg residual with ordered group reduction. The Systolic provider uses SAG1 for supported FP32 C384 groups; CPU execution preserves the unfused numerical operations.")
+      .Input(0, "X", "Input [B,E,C]", "T")
+      .Input(1, "q", "Shared Unique inverse [E]", "tensor(int64)")
+      .Input(2, "Wg", "Score weights [C,C]", "T")
+      .Input(3, "bg", "Score bias [C]", "T")
+      .Input(4, "Wf", "Value weights [C,C]", "T")
+      .Input(5, "bf", "Value bias [C]", "T")
+      .Input(6, "Wh", "Output weights [C,C]", "T")
+      .Input(7, "bh", "Output bias [C]", "T")
+      .Output(0, "Z", "Residual output [B,E,C]", "T")
+      .TypeConstraint("T", {"tensor(float)"}, "FP32 tensors")
+      .TypeAndShapeInferenceFunction(ONNX_NAMESPACE::propagateShapeAndTypeFromFirstInput);
+
+  ONNX_SYSTOLIC_OPERATOR_SCHEMA(correlation_batch)
+      .SetDomain("dpvo")
+      .SinceVersion(1)
+      .SetDoc("Private synchronous in-process DPVO correlation API. windows contains borrowed live feature addresses, not portable serialized tensor data. All views are validated before hardware submission.")
+      .Input(0, "A", "Patch vectors [N,C]", "T")
+      .Input(1, "windows", "Two {address,H,W,x,y} feature views per job [N,10]", "tensor(int64)")
+      .Output(0, "dots", "Integer-grid dot products [N,128]", "T")
+      .Output(1, "counters", "Six gather counters and used_gather flag [N,7]", "tensor(uint64)")
+      .Attr("gather", "Explicit matched-CGR1-build opt-in", AttributeProto::INT, static_cast<int64_t>(0))
+      .TypeConstraint("T", {"tensor(float)"}, "FP32 tensors")
+      .TypeAndShapeInferenceFunction([](InferenceContext& ctx) {
+        ONNX_NAMESPACE::propagateElemTypeFromInputToOutput(ctx, 0, 0);
+        ctx.getOutputType(1)->mutable_tensor_type()->set_elem_type(TensorProto::UINT64);
+        if (!ONNX_NAMESPACE::hasInputShape(ctx, 0)) return;
+        const auto& a = ONNX_NAMESPACE::getInputShape(ctx, 0);
+        if (a.dim_size() != 2) fail_shape_inference("correlation_batch requires A[N,C]");
+        for (size_t index = 0; index < 2; ++index) {
+          auto* shape = ctx.getOutputType(index)->mutable_tensor_type()->mutable_shape();
+          *shape->add_dim() = a.dim(0);
+          shape->add_dim()->set_dim_value(index == 0 ? 128 : 7);
+        }
+      });
+
   ONNX_SYSTOLIC_OPERATOR_SCHEMA(Conv1x1_nhwc_nchw)
       .SinceVersion(1)
       .SetDoc("Internal FP32 pointwise convolution: NHWC input, OIHW 1x1 weights, NCHW output. Unit stride, no padding, group=1; optional bias and Relu.")

@@ -902,6 +902,14 @@ endif()
 
 # Reference https://github.com/microsoft/onnxruntime/commit/358b517d49af60890bb1901f2d621d0943ad70f5#diff-59b1f660e7a801f54f1415df9dec89ab
 if (onnxruntime_USE_SYSTOLIC)
+  # The DPVO CPU reference keeps Div, Mul and ordered Add as separate FP32
+  # operations, matching the unfused graph and the SAG1 arithmetic contract.
+  if (NOT MSVC)
+    set_source_files_properties(
+      "${ONNXRUNTIME_ROOT}/core/providers/cpu/nn/dpvo_ops.cc"
+      "${ONNXRUNTIME_ROOT}/core/providers/systolic/nn/dpvo_ops.cc"
+      PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
+  endif()
   file(GLOB_RECURSE onnxruntime_providers_systolic_cc_srcs CONFIGURE_DEPENDS
     "${ONNXRUNTIME_ROOT}/core/providers/systolic/*.h"
     "${ONNXRUNTIME_ROOT}/core/providers/systolic/*.cc"

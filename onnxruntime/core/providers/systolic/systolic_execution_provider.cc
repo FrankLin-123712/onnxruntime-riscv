@@ -10,6 +10,8 @@
 #include "core/mlas/inc/systolic_fp16.h"
 #endif
 #include "core/framework/compute_capability.h"
+#include "core/providers/cpu/nn/dpvo_ops.h"
+#include <algorithm>
 
 #ifdef ENABLE_TRAINING
 #include "orttraining/training_ops/systolic/systolic_training_kernels.h"
@@ -35,6 +37,8 @@ class ONNX_OPERATOR_TYPED_KERNEL_CLASS_NAME(kSystolicExecutionProvider, kOnnxDom
 #endif
 
 #ifdef SYSTOLIC_FP32
+class ONNX_OPERATOR_KERNEL_CLASS_NAME(kSystolicExecutionProvider, kDpvoDomain, 1, softagg_onchip);
+class ONNX_OPERATOR_KERNEL_CLASS_NAME(kSystolicExecutionProvider, kDpvoDomain, 1, correlation_batch);
 class ONNX_OPERATOR_KERNEL_CLASS_NAME(kSystolicExecutionProvider, kOnnxDomain, 1, Conv1x1_nhwc_nchw);
 class ONNX_OPERATOR_VERSIONED_TYPED_KERNEL_CLASS_NAME(kSystolicExecutionProvider, kOnnxDomain, 7, 12, float, Add);
 class ONNX_OPERATOR_VERSIONED_TYPED_KERNEL_CLASS_NAME(kSystolicExecutionProvider, kOnnxDomain, 13, 13, float, Add);
@@ -77,6 +81,8 @@ static Status RegisterSystolicKernels(KernelRegistry& kernel_registry) {
       BuildKernelCreateInfo<ONNX_OPERATOR_TYPED_KERNEL_CLASS_NAME(kSystolicExecutionProvider, kOnnxDomain, 10, int8_t, QLinearConv_nhwc)>, 
 #endif
 #ifdef SYSTOLIC_FP32
+      BuildKernelCreateInfo<ONNX_OPERATOR_KERNEL_CLASS_NAME(kSystolicExecutionProvider, kDpvoDomain, 1, softagg_onchip)>,
+      BuildKernelCreateInfo<ONNX_OPERATOR_KERNEL_CLASS_NAME(kSystolicExecutionProvider, kDpvoDomain, 1, correlation_batch)>,
       BuildKernelCreateInfo<ONNX_OPERATOR_KERNEL_CLASS_NAME(kSystolicExecutionProvider, kOnnxDomain, 1, Conv1x1_nhwc_nchw)>,
       BuildKernelCreateInfo<ONNX_OPERATOR_VERSIONED_TYPED_KERNEL_CLASS_NAME(kSystolicExecutionProvider, kOnnxDomain, 7, 12, float, Add)>,
       BuildKernelCreateInfo<ONNX_OPERATOR_VERSIONED_TYPED_KERNEL_CLASS_NAME(kSystolicExecutionProvider, kOnnxDomain, 13, 13, float, Add)>,
@@ -157,6 +163,25 @@ SystolicExecutionProvider::GetCapability(const onnxruntime::GraphViewer& graph,
                                     const std::vector<const KernelRegistry*>& kernel_registries) const {
   std::vector<std::unique_ptr<ComputeCapability>>
       result = IExecutionProvider::GetCapability(graph, kernel_registries);
+
+  // Decline statically unsupported DPVO work so its native CPU kernel is
+  // assigned before execution. Dynamic topology/group checks run in Compute,
+  // before the first accelerator job. Other existing kernels retain their
+  // capability rules and numerical behavior.
+  result.erase(std::remove_if(result.begin(), result.end(), [&](const std::unique_ptr<ComputeCapability>& capability) {
+    if (!capability->sub_graph || capability->sub_graph->nodes.size() != 1) return false;
+    const Node* node = graph.GetNode(capability->sub_graph->nodes[0]);
+    if (!node || node->Domain() != kDpvoDomain) return false;
+    if (node->OpType() == "softagg_onchip") {
+      if (provider_info_.accelerator_mode != 2) return true;
+      const auto* shape = node->InputDefs()[0]->Shape();
+      if (shape && shape->dim_size() == 3 && shape->dim(2).has_dim_value() &&
+          shape->dim(2).dim_value() != 384) return true;
+    } else if (node->OpType() == "correlation_batch" && provider_info_.accelerator_mode == 0) {
+      return true;
+    }
+    return false;
+  }), result.end());
 
   for (auto& rule : fuse_rules_) {
     rule(graph, result);
