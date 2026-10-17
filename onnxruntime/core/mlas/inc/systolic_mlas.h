@@ -207,10 +207,19 @@ struct GatherStatistics {
 };
 
 void Probe();
+// Session variants use caller-owned local reservations. Bases count 64-byte
+// SP rows: A must be DIM16 aligned, B must be 1024-row aligned, and the
+// A[128 rows]/B[1024 rows] address extents must not overlap.
+// The active systolic_local::Session must span producer and consumer.
+void ProbeAt();
+GatherStatistics GatherAt(const float* a, const Window& level0, const Window& level1,
+                          uint32_t a_base, uint32_t b_base);
+void DotAt(uint32_t a_base, uint32_t b_base, uint32_t b_rows, float* output);
 // Caller validates tensor/coordinate bounds and opts into matching CGR1 hardware.
 // Load A[1,128], gather both windows into native B tiles, wait and check status,
 // then return this job's counters. Throws on error; partial B must not be used.
-// Gather/DotPreloaded require exclusive Gemmini use; do not interleave operations.
+// Legacy split calls reject DotPreloaded if another hardware helper or local
+// session has intervened after Gather. Prefer the session variants above.
 GatherStatistics Gather(const float* a, const Window& level0, const Window& level1);
 // Consume the A/B prepared by Gather -> 128 FP32 dots; restore loop SPAD bounds.
 void DotPreloaded(float* output);

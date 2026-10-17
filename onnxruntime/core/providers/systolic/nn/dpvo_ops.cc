@@ -7,6 +7,7 @@
 #include "core/providers/systolic/systolic_fwd.h"
 #include "core/mlas/inc/mlas.h"
 #include "core/mlas/inc/systolic_mlas.h"
+#include "core/providers/systolic/gemmini_executor.h"
 #include <vector>
 
 namespace onnxruntime {
@@ -63,23 +64,7 @@ class CorrelationBatch final : public OpKernel {
     // The explicit model attribute is a matched-build opt-in. Never probe a
     // legacy bitstream merely to discover whether a custom instruction exists.
     if (mode_ == 2 && gather_ && dpvo::CorrelationGatherSupported(in)) {
-      systolic_corr::Probe();
-      for (size_t j = 0; j < in.jobs; ++j) {
-        systolic_corr::Window windows[2];
-        for (size_t level = 0; level < 2; ++level) {
-          const int64_t* w = in.windows + j * 10 + level * 5;
-          windows[level] = {reinterpret_cast<const float*>(static_cast<uintptr_t>(w[0])),
-              static_cast<uint32_t>(w[1]), static_cast<uint32_t>(w[2]),
-              static_cast<int32_t>(w[3]), static_cast<int32_t>(w[4])};
-        }
-        const auto stats = systolic_corr::Gather(in.a + j * in.channels, windows[0], windows[1]);
-        systolic_corr::DotPreloaded(in.dots + j * 128);
-        uint64_t* counters = in.counters + j * 7;
-        counters[0] = stats.cycles; counters[1] = stats.useful_bytes;
-        counters[2] = stats.strips; counters[3] = stats.rows;
-        counters[4] = stats.read_stalls; counters[5] = stats.write_stalls;
-        counters[6] = 1;
-      }
+      GemminiExecutor::Correlation(in);
       return Status::OK();
     }
     if (mode_ > 0) {
