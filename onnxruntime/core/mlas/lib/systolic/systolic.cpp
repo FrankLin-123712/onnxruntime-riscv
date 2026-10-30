@@ -895,8 +895,11 @@ constexpr uint32_t kAcc = UINT32_C(0x80000000);
 constexpr uint32_t kAccumulate = UINT32_C(0x40000000);
 constexpr uint32_t kBiasS = 3840;
 constexpr uint32_t kBiasV = 3856;
-constexpr uint32_t kXRow = 3872;
 constexpr uint32_t kOutputRow = 3873;
+// Phase-2 staging past bh (3840-3847) and biasV (3856): member X rows, then outputs.
+constexpr uint32_t kResidualInput = 3872;
+constexpr uint32_t kResidualOutput = 3984;
+constexpr uint32_t kResidualRows = 112;
 constexpr uint64_t kMagic = UINT64_C(0x5341473100000000);
 
 struct Traffic {
@@ -925,12 +928,12 @@ void CheckEngine() {
   Require(!(status & 1), "SoftAgg local engine reported an error");
 }
 void RunGroup(uint32_t s, uint32_t v, uint32_t bias_s, uint32_t bias_v,
-              uint32_t count, bool residual, Traffic& traffic) {
+              uint32_t count, bool residual, uint32_t out, Traffic& traffic) {
   const uint64_t biases = (uint64_t(bias_v) << 32) | bias_s;
   const uint64_t strides = (UINT64_C(1) << 32) | (residual ? 0 : 1);
   ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, biases, strides, 45);
   const uint64_t sources = (uint64_t(v) << 32) | s;
-  const uint64_t destination = (uint64_t(kOutputRow) << 32) |
+  const uint64_t destination = (uint64_t(out) << 32) |
       (uint64_t(count) << 16) | (UINT64_C(16) << 8) | (residual ? 1 : 0);
   ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, sources, destination, 46);
   traffic.commands += 2;
@@ -1083,7 +1086,7 @@ void SystolicSoftAggResidual(const float* x, const int64_t* q,
             const uint32_t row = static_cast<uint32_t>(offsets[g] - offsets[first]);
             for (uint32_t j = 0; j < panel / DIM; ++j) {
               RunGroup(kAcc | (j * tile_rows + row), kAcc | (512 + j * tile_rows + row),
-                       kBiasS + j, kBiasV + j, n, false, traffic);
+                       kBiasS + j, kBiasV + j, n, false, kOutputRow, traffic);
               gemmini_extended_mvout(y + g * channels + c + j * DIM, kOutputRow, DIM, 1);
               traffic.y_write += DIM * sizeof(float);
               traffic.Dma(y + g * channels + c + j * DIM, 1, DIM);
@@ -1104,19 +1107,28 @@ void SystolicSoftAggResidual(const float* x, const int64_t* q,
         const uint32_t count = static_cast<uint32_t>(std::min<size_t>(h_rows, groups - first));
         LoadGroupRows(y, first, count, h_weight_rows, traffic);
         MatmulLocal(h_weight_rows, 0, 0, count, h_panel, h_rows, traffic);
+        // One residual RUN per group block: strideS=0 reuses the H row for every
+        // member, so the n X rows share one admission and one STATUS wait.
         for (uint32_t g = 0; g < count; ++g)
-          for (size_t member = offsets[first + g]; member < offsets[first + g + 1]; ++member) {
-            const size_t e = edge_ids[member];
-            for (uint32_t j = 0; j < h_panel / DIM; ++j) {
-              gemmini_extended_mvin(input + e * channels + c + j * DIM, kXRow, DIM, 1);
-              traffic.x += DIM * sizeof(float);
-              traffic.Dma(input + e * channels + c + j * DIM, 1, DIM);
-              RunGroup(kAcc | (j * h_rows + g), kXRow, kBiasS + j, kBiasV, 1, true, traffic);
-              gemmini_extended_mvout(result + e * channels + c + j * DIM, kOutputRow, DIM, 1);
-              traffic.output += DIM * sizeof(float);
-              traffic.Dma(result + e * channels + c + j * DIM, 1, DIM);
+          for (uint32_t j = 0; j < h_panel / DIM; ++j)
+            for (size_t begin = offsets[first + g], end = offsets[first + g + 1]; begin < end;
+                 begin += kResidualRows) {
+              const uint32_t n = static_cast<uint32_t>(std::min<size_t>(kResidualRows, end - begin));
+              for (uint32_t m = 0; m < n; ++m) {
+                const float* source = input + edge_ids[begin + m] * channels + c + j * DIM;
+                gemmini_extended_mvin(source, kResidualInput + m, DIM, 1);
+                traffic.x += DIM * sizeof(float);
+                traffic.Dma(source, 1, DIM);
+              }
+              RunGroup(kAcc | (j * h_rows + g), kResidualInput, kBiasS + j, kBiasV, n, true,
+                       kResidualOutput, traffic);
+              for (uint32_t m = 0; m < n; ++m) {
+                float* destination = result + edge_ids[begin + m] * channels + c + j * DIM;
+                gemmini_extended_mvout(destination, kResidualOutput + m, DIM, 1);
+                traffic.output += DIM * sizeof(float);
+                traffic.Dma(destination, 1, DIM);
+              }
             }
-          }
       }
     }
     Fence();
@@ -1125,8 +1137,8 @@ void SystolicSoftAggResidual(const float* x, const int64_t* q,
   ++traffic.commands;
   if (profile.Active()) {
     std::ostringstream detail;
-    detail << "abi=SAG1;order=panel;B=" << batches << ";E=" << edges << ";G=" << groups
-           << ";T=" << tile_rows << ";O=" << panel << ";hT=32;hO=128"
+    detail << "abi=SAG1;order=panel;residual=group;B=" << batches << ";E=" << edges
+           << ";G=" << groups << ";T=" << tile_rows << ";O=" << panel << ";hT=32;hO=128"
            << ";weight_read_bytes=" << traffic.weights << ";bias_read_bytes=" << traffic.bias
            << ";x_read_bytes=" << traffic.x << ";y_read_bytes=" << traffic.y_read
            << ";y_write_bytes=" << traffic.y_write << ";output_write_bytes=" << traffic.output
