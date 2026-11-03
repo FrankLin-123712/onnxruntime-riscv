@@ -156,6 +156,7 @@ void SystolicFlush() {
 #ifdef SYSTOLIC_FP32
 #include "conv_rect.h"
 #include "gemmini_nhwc_norm.h"
+#include "gemmini_row_layernorm.h"
 
 namespace {
 struct PointwiseTile { size_t co, spatial, ci; };  // Counts of DIM-sized blocks.
@@ -1281,5 +1282,170 @@ void SystolicSoftAggResidual(const float* x, const int64_t* q,
   }
 #else
   throw std::runtime_error("SoftAgg C requires a RISC-V FP32 build and SAG1 hardware");
+#endif
+}
+
+bool SystolicLayerNormRows(char accelerator_mode, const float* x, const float* gamma,
+                           const float* beta, float* y, size_t rows, size_t channels,
+                           float epsilon, bool relu, int variant,
+                           void (*fallback)(void* context, size_t first_row, size_t row_count),
+                           void* fallback_context) {
+#if defined(__riscv) && defined(SYSTOLIC_FP32) && !defined(SYSTOLIC_FP16) && \
+    defined(GEMMINI_NHWC_NORM_HELPER_ENABLED)
+  if (accelerator_mode != 2 || !fallback) return false;
+  if (rows == 0) return true;
+  if (!x || !gamma || !beta || !y || channels == 0 ||
+      rows > std::numeric_limits<size_t>::max() / channels / sizeof(float))
+    return false;
+  const size_t floats = gemmini_row_layernorm_workspace_floats(channels);
+  // Reused across calls: one allocation (and its page faults) per process.
+  // MLAS uses C++14, whose vector allocator need not honor alignas(64).
+  static std::vector<float> storage;
+  static std::vector<uint8_t> flags;
+  if (storage.size() < floats + 16) storage.resize(floats + 16);
+  float* workspace = storage.data();
+  while (reinterpret_cast<uintptr_t>(workspace) % 64) ++workspace;
+  const size_t blocks = (rows + DIM - 1) / DIM;
+  if (flags.size() < blocks) flags.resize(blocks);
+  ort_replay::Scope profile("kernel", "layer_norm.rows_hw", "LayerNormRows", "Gemmini");
+  GemminiRowLayerNormProfile counters;
+  if (!gemmini_row_layernorm(x, gamma, beta, y, rows, channels, epsilon, relu, variant,
+                             workspace, floats, flags.data(),
+                             profile.Active() ? &counters : nullptr))
+    return false;
+  for (size_t b = 0; b < blocks; ++b)
+    if (flags[b]) {
+      const size_t first = b * DIM;
+      fallback(fallback_context, first, std::min<size_t>(DIM, rows - first));
+    }
+  if (profile.Active()) {
+    std::ostringstream detail;
+    detail << "abi=nhwc_norm_v1;path=row_layernorm_h0;variant="
+           << (variant == GEMMINI_ROW_LN_SUBTRACT ? "subtract" : "affine")
+           << ";rows=" << rows << ";C=" << channels << ";relu=" << relu
+           << ";blocks=" << counters.blocks << ";rounds=" << counters.rounds
+           << ";fences=" << counters.fences << ";rocc_commands=" << counters.commands
+           << ";fallback_blocks=" << counters.fallback_blocks
+           << ";setup_cycles=" << counters.setup_cycles << ";issue_cycles=" << counters.issue_cycles
+           << ";cpu_cycles=" << counters.cpu_cycles << ";fence_cycles=" << counters.fence_cycles
+           << ";finish_cycles=" << counters.finish_cycles;
+    profile.Detail(detail.str().c_str());
+  }
+  return true;
+#else
+  (void)accelerator_mode; (void)x; (void)gamma; (void)beta; (void)y; (void)rows;
+  (void)channels; (void)epsilon; (void)relu; (void)variant; (void)fallback;
+  (void)fallback_context;
+  return false;
+#endif
+}
+
+bool SystolicMatMulBias(char accelerator_mode, bool relu, const float* x, const float* w,
+                        const float* bias, float* y, size_t M, size_t K, size_t N) {
+#if defined(__riscv) && defined(SYSTOLIC_FP32) && !defined(SYSTOLIC_FP16)
+  static_assert(DIM == 16 && BANK_NUM * BANK_ROWS == 4096 && ACC_ROWS == 1024,
+                "MatMulBias requires FP32 DIM16 SP256KiB/ACC64KiB");
+  if (accelerator_mode != 2) return false;
+  if (M == 0 || N == 0) return true;
+  if (!x || !w || !bias || !y || K == 0 || K % DIM || N % DIM || K > 768 ||
+      M > UINT32_MAX || K * sizeof(float) > UINT32_MAX || N * sizeof(float) > UINT32_MAX)
+    return false;
+  const auto overlaps = [](const void* a, size_t a_bytes, const void* b, size_t b_bytes) {
+    const auto pa = reinterpret_cast<uintptr_t>(a), pb = reinterpret_cast<uintptr_t>(b);
+    return pa < pb + b_bytes && pb < pa + a_bytes;
+  };
+  const size_t y_bytes = M * N * sizeof(float);
+  if (overlaps(y, y_bytes, x, M * K * sizeof(float)) ||
+      overlaps(y, y_bytes, w, K * N * sizeof(float)) ||
+      overlaps(y, y_bytes, bias, N * sizeof(float)))
+    return false;
+
+  constexpr uint32_t kAcc = 1u << 31, kAccumulate = 1u << 30;
+  constexpr uint32_t kWeightRows = 3072;  // banks 0-2: one weight panel
+  constexpr uint32_t kRingBase = 3072;    // bank 3: x tiles, one slot per K step
+  constexpr uint32_t kRingRows = 1024;
+  constexpr uint32_t kAccHalf = 512;      // two C superblocks alternate
+  const uint32_t k_chunks = static_cast<uint32_t>(K / DIM);
+  uint32_t panel = (kWeightRows / k_chunks) / DIM * DIM;
+  if (panel > 128) panel = 128;
+  if (panel > N) panel = static_cast<uint32_t>(N);
+  // C superblock of rows x panel in one accumulator half (<= 32 tiles).
+  const uint32_t rows_per_block = DIM * ((kAccHalf / DIM) / (panel / DIM));
+  const uint32_t row_tiles = rows_per_block / DIM;
+  const uint32_t slots = kRingRows / rows_per_block;
+  if (slots == 0) return false;
+
+  ort_replay::Scope profile("kernel", "matmul.bias_sw_ws", relu ? "MatMulBiasRelu" : "MatMulBias",
+                            "SystolicExecutionProvider");
+  uint64_t commands = 0;
+
+  asm volatile("fence" ::: "memory");
+  gemmini_extended_config_ex(WEIGHT_STATIONARY, NO_ACTIVATION, 0, 0, 1, 0, 0);
+  gemmini_extended4_config_ld(K * sizeof(float), MVIN_SCALE_IDENTITY, false, DIM, 0);  // x
+  gemmini_extended4_config_ld(N * sizeof(float), MVIN_SCALE_IDENTITY, false, DIM, 1);  // w
+  gemmini_extended4_config_ld(0, MVIN_SCALE_IDENTITY, false, DIM, 2);                  // bias
+  gemmini_extended_config_st(N * sizeof(float), relu ? RELU : NO_ACTIVATION, ACC_SCALE_IDENTITY);
+  commands += 2 + 3 + 1;
+
+  uint32_t half = 0, slot = 0;
+  for (size_t p0 = 0; p0 < N; p0 += panel) {
+    const uint32_t width = static_cast<uint32_t>(std::min<size_t>(panel, N - p0));
+    const uint32_t col_tiles = width / DIM;
+    for (uint32_t k = 0; k < k_chunks; ++k)
+      for (uint32_t j = 0; j < col_tiles; ++j)
+        gemmini_extended_mvin2(w + size_t(k) * DIM * N + p0 + j * DIM,
+                               (k * col_tiles + j) * DIM, DIM, DIM);
+    commands += size_t(k_chunks) * col_tiles;
+    for (size_t m0 = 0; m0 < M; m0 += rows_per_block, half ^= 1) {
+      const uint32_t rows = static_cast<uint32_t>(std::min<size_t>(rows_per_block, M - m0));
+      const uint32_t tiles = (rows + DIM - 1) / DIM;
+      const uint32_t acc_base = half * kAccHalf;
+      const auto tile_rows = [&](uint32_t i) { return std::min<uint32_t>(DIM, rows - i * DIM); };
+      const auto acc_tile = [&](uint32_t j, uint32_t i) { return acc_base + (j * row_tiles + i) * DIM; };
+      for (uint32_t k = 0; k < k_chunks; ++k, slot = (slot + 1) % slots) {
+        const uint32_t ring = kRingBase + slot * rows_per_block;
+        for (uint32_t i = 0; i < tiles; ++i)
+          gemmini_extended_mvin(x + (m0 + size_t(i) * DIM) * K + size_t(k) * DIM,
+                                ring + i * DIM, DIM, tile_rows(i));
+        for (uint32_t j = 0; j < col_tiles; ++j)
+          for (uint32_t i = 0; i < tiles; ++i) {
+            const uint32_t r = tile_rows(i);
+            const uint32_t weights = i == 0 ? (k * col_tiles + j) * DIM : GARBAGE_ADDR;
+            const uint32_t out = kAcc | (k ? kAccumulate : 0) | acc_tile(j, i);
+            gemmini_extended_preload(weights, out, DIM, DIM, DIM, r);
+            if (i == 0) {
+              gemmini_extended_compute_preloaded(ring, GARBAGE_ADDR, DIM, r, DIM, DIM);
+            } else {
+              gemmini_extended_compute_accumulated(ring + i * DIM, GARBAGE_ADDR, DIM, r, DIM, DIM);
+            }
+          }
+        commands += tiles + 2 * size_t(col_tiles) * tiles;
+      }
+      // Bias after the complete K sum, then store (optional ReLU).
+      for (uint32_t j = 0; j < col_tiles; ++j)
+        for (uint32_t i = 0; i < tiles; ++i)
+          gemmini_extended_mvin3(bias + p0 + j * DIM, kAcc | kAccumulate | acc_tile(j, i), DIM,
+                                 tile_rows(i));
+      for (uint32_t j = 0; j < col_tiles; ++j)
+        for (uint32_t i = 0; i < tiles; ++i)
+          gemmini_extended_mvout(y + (m0 + size_t(i) * DIM) * N + p0 + j * DIM,
+                                 kAcc | acc_tile(j, i), DIM, tile_rows(i));
+      commands += 2 * size_t(col_tiles) * tiles;
+    }
+  }
+  gemmini_fence();
+  asm volatile("fence" ::: "memory");
+  if (profile.Active()) {
+    std::ostringstream detail;
+    detail << "dtype=fp32;M=" << M << ";K=" << K << ";N=" << N << ";relu=" << relu
+           << ";panel=" << panel << ";rows_per_block=" << rows_per_block << ";ring_slots=" << slots
+           << ";rocc_commands=" << commands << ";path=sw_ws_bias_after";
+    profile.Detail(detail.str().c_str());
+  }
+  return true;
+#else
+  (void)accelerator_mode; (void)relu; (void)x; (void)w; (void)bias; (void)y;
+  (void)M; (void)K; (void)N;
+  return false;
 #endif
 }

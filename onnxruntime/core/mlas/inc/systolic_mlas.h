@@ -33,6 +33,34 @@ void SystolicSoftAggResidual(const float* x, const int64_t* q,
                             const float* wf, const float* bf,
                             const float* wh, const float* bh, float* output);
 
+// Row LayerNorm (HW-1 H0) on the FP32 DIM16 NHWC normalizer:
+//   y[r, :] = (x[r, :] - mean) * (1 / sigma) * gamma + beta [-> ReLU]
+// for a contiguous [rows, channels] x, with the decomposed ONNX graph's
+// statistics (bitwise) and z = fl(fl(x - mean) * fl(1 / sigma)) in place of
+// the graph's fl(d / sigma) (variant 0; variant 1 is the plan's affine
+// z = fl(fl(x * alpha) - fl(mean * alpha))). Returns false, with no output
+// writes and no accelerator instructions, unless mode 2 on a build with the
+// NHWC normalization ABI and channels a multiple of 16 in [16, 496]. After a
+// true return, fallback(context, first_row, row_count) has been called for
+// each 16-row block whose statistics were not finite; the caller recomputes
+// those rows. x and y must not overlap; gamma/beta hold channels floats.
+bool SystolicLayerNormRows(char accelerator_mode, const float* x, const float* gamma,
+                           const float* beta, float* y, size_t rows, size_t channels,
+                           float epsilon, bool relu, int variant,
+                           void (*fallback)(void* context, size_t first_row, size_t row_count),
+                           void* fallback_context);
+
+// MatMul + row bias [+ ReLU] (SW-2 B1): y[M,N] = x[M,K] * w[K,N] + bias[N].
+// Mode 2 runs a software-issued WS loop: a weight panel stays in the
+// scratchpad, x streams through it, K accumulates in the accumulator in the
+// same order and 16-term PE partials as the WS MatMul, and only then is the
+// bias row added by a stride-0 accumulating mvin and stored with optional
+// ReLU. The result is bit-identical to MatMul followed by SystolicBiasAdd.
+// Returns false (no instructions, no writes) for other modes, K or N not a
+// multiple of 16, K > 768, or overlapping y. Row strides are K and N.
+bool SystolicMatMulBias(char accelerator_mode, bool relu, const float* x, const float* w,
+                        const float* bias, float* y, size_t M, size_t K, size_t N);
+
 #ifdef SYSTOLIC_INT8
 
 void SystolicMultiply
