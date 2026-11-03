@@ -103,6 +103,22 @@ MLASCALL(char accelerator_mode, bool relu, const float* in1, float in1_scale,
          const float* in2, float in2_scale, float* out, float out_scale,
          size_t dim);
 
+// Row-bias add: out[r, c] = x[r, c] + bias[c] for a contiguous [rows, cols] x.
+// Mode 2 loads each x tile into the accumulator, accumulates the bias row with
+// a stride-0 mvin, and stores with optional ReLU, so every element is a single
+// FP32 add, bit-identical to the CPU broadcast. Returns false (no writes, no
+// instructions) for other modes; the caller keeps its CPU path. out may alias
+// x exactly; bias must not overlap out.
+bool SystolicBiasAdd(char accelerator_mode, bool relu, const float* x,
+                     const float* bias, float* out, size_t rows, size_t cols);
+
+// Same-shape add with two outputs: out = in1 + in2 and relu_out = max(out, 0)
+// (Gemmini store-side ReLU semantics). Mode 2 stores one accumulator tile
+// twice; other modes return false without writing. Outputs must not overlap
+// the inputs or each other.
+bool SystolicAddDualOut(char accelerator_mode, const float* in1, const float* in2,
+                        float* out, float* relu_out, size_t dim);
+
 // NHWC/HWIO rectangular WS convolution; false means no instructions issued.
 bool SystolicConvRect(char accelerator_mode, int64_t batch,
                      int64_t input_h, int64_t input_w, int64_t input_channels,

@@ -629,6 +629,136 @@ void SystolicAdd(char accelerator_mode, bool relu, const float* A, float A_scale
   // The legacy gemmini_fence macro has no compiler memory clobber.
   asm volatile("fence" ::: "memory");
 }
+
+namespace {
+// Accumulator local addresses: bit 31 selects the accumulator, bit 30 makes a
+// mvin accumulate into it instead of overwriting.
+constexpr uint32_t kAccAddr = 1u << 31;
+constexpr uint32_t kAccAccumulate = 1u << 30;
+// Two halves of the accumulator alternate so one group's mvout can overlap the
+// next group's mvin; the reservation station orders same-address accesses.
+constexpr size_t kAccHalfBlocks = ACC_ROWS / DIM / 2;
+static_assert(kAccHalfBlocks >= 1, "bias resadd needs at least two acc blocks");
+}  // namespace
+
+bool SystolicBiasAdd(char accelerator_mode, bool relu, const float* x,
+                     const float* bias, float* out, size_t rows, size_t cols) {
+  if (accelerator_mode != 2) return false;
+  if (rows == 0 || cols == 0) return true;
+  if (!x || !bias || !out)
+    throw std::invalid_argument("Invalid FP32 bias Add buffers");
+  if (cols > UINT32_MAX / sizeof(float)) return false;
+
+  ort_replay::Scope profile("kernel", "add.bias_resadd", relu ? "AddRelu" : "Add",
+                            "SystolicExecutionProvider");
+  if (profile.Active()) {
+    const std::string detail = "dtype=fp32;rows=" + std::to_string(rows) +
+        ";cols=" + std::to_string(cols) + ";fused_relu=" + std::to_string(relu) +
+        ";path=accumulator_stride0_bias";
+    profile.Detail(detail.c_str());
+  }
+
+  // Per DIM x DIM block: x overwrites an accumulator block (mvin), the bias
+  // row is accumulated into every row of it with a stride-0 mvin2 (the DMA
+  // reads one row and repeats it), and mvout applies optional ReLU. Each output
+  // element is one FP32 add fl(x + b), the same rounding as the CPU path.
+  asm volatile("fence" ::: "memory");
+  gemmini_extended_config_st(cols * sizeof(float), relu ? RELU : NO_ACTIVATION,
+                             ACC_SCALE_IDENTITY);
+  gemmini_config_ex(WS, 0, 0, 0);
+  gemmini_extended4_config_ld(cols * sizeof(float), MVIN_SCALE_IDENTITY, true, DIM, 0);
+  gemmini_extended4_config_ld(0, MVIN_SCALE_IDENTITY, true, DIM, 1);
+
+  const size_t col_blocks = cols / DIM + (cols % DIM != 0);
+  size_t half = 0;
+  for (size_t i = 0; i < rows; i += DIM) {
+    const size_t r = std::min<size_t>(DIM, rows - i);
+    for (size_t j0 = 0; j0 < col_blocks; j0 += kAccHalfBlocks, half ^= 1) {
+      const size_t j1 = std::min(col_blocks, j0 + kAccHalfBlocks);
+      const uint32_t base = static_cast<uint32_t>(half * kAccHalfBlocks * DIM);
+      for (size_t jb = j0; jb < j1; ++jb) {
+        const size_t c = std::min<size_t>(DIM, cols - jb * DIM);
+        const uint32_t acc = base + static_cast<uint32_t>((jb - j0) * DIM);
+        gemmini_extended_mvin(x + i * cols + jb * DIM, kAccAddr | acc, c, r);
+      }
+      for (size_t jb = j0; jb < j1; ++jb) {
+        const size_t c = std::min<size_t>(DIM, cols - jb * DIM);
+        const uint32_t acc = base + static_cast<uint32_t>((jb - j0) * DIM);
+        gemmini_extended_mvin2(bias + jb * DIM, kAccAddr | kAccAccumulate | acc, c, r);
+      }
+      for (size_t jb = j0; jb < j1; ++jb) {
+        const size_t c = std::min<size_t>(DIM, cols - jb * DIM);
+        const uint32_t acc = base + static_cast<uint32_t>((jb - j0) * DIM);
+        gemmini_extended_mvout(out + i * cols + jb * DIM, kAccAddr | acc, c, r);
+      }
+    }
+  }
+  gemmini_fence();
+  asm volatile("fence" ::: "memory");
+  return true;
+}
+
+bool SystolicAddDualOut(char accelerator_mode, const float* in1, const float* in2,
+                        float* out, float* relu_out, size_t dim) {
+  if (accelerator_mode != 2) return false;
+  if (dim == 0) return true;
+  if (!in1 || !in2 || !out || !relu_out)
+    throw std::invalid_argument("Invalid FP32 dual-output Add buffers");
+
+  ort_replay::Scope profile("kernel", "add.dual_out", "AddDualOut",
+                            "SystolicExecutionProvider");
+  if (profile.Active()) {
+    const std::string detail = "dtype=fp32;elements=" + std::to_string(dim) +
+        ";path=accumulator_dual_mvout";
+    profile.Detail(detail.c_str());
+  }
+
+  // Same tiling as SystolicAdd (rows of DIM contiguous elements). Each
+  // accumulator group is stored twice: once without activation, then with the
+  // store-side ReLU. config_st is ordered with mvout in the store queue.
+  asm volatile("fence" ::: "memory");
+  gemmini_config_ex(WS, 0, 0, 0);
+  gemmini_extended4_config_ld(DIM * sizeof(float), MVIN_SCALE_IDENTITY, true, DIM, 0);
+  gemmini_extended4_config_ld(DIM * sizeof(float), MVIN_SCALE_IDENTITY, true, DIM, 1);
+  const auto group = [&](size_t offset, size_t rows, size_t cols, uint32_t base) {
+    for (size_t i = 0; i < rows; i += DIM) {
+      const size_t r = std::min<size_t>(DIM, rows - i);
+      gemmini_extended_mvin(in1 + offset + i * cols, kAccAddr | (base + i), cols, r);
+    }
+    for (size_t i = 0; i < rows; i += DIM) {
+      const size_t r = std::min<size_t>(DIM, rows - i);
+      gemmini_extended_mvin2(in2 + offset + i * cols,
+                             kAccAddr | kAccAccumulate | (base + i), cols, r);
+    }
+    gemmini_extended_config_st(cols * sizeof(float), NO_ACTIVATION, ACC_SCALE_IDENTITY);
+    for (size_t i = 0; i < rows; i += DIM) {
+      const size_t r = std::min<size_t>(DIM, rows - i);
+      gemmini_extended_mvout(out + offset + i * cols, kAccAddr | (base + i), cols, r);
+    }
+    gemmini_extended_config_st(cols * sizeof(float), RELU, ACC_SCALE_IDENTITY);
+    for (size_t i = 0; i < rows; i += DIM) {
+      const size_t r = std::min<size_t>(DIM, rows - i);
+      gemmini_extended_mvout(relu_out + offset + i * cols, kAccAddr | (base + i), cols, r);
+    }
+  };
+  constexpr size_t kHalfRows = kAccHalfBlocks * DIM;
+  const size_t rows = dim / DIM;
+  size_t half = 0;
+  for (size_t r0 = 0; r0 < rows; r0 += kHalfRows, half ^= 1) {
+    group(r0 * DIM, std::min(kHalfRows, rows - r0), DIM,
+          static_cast<uint32_t>(half * kHalfRows));
+  }
+  const size_t tail = dim % DIM;
+  if (tail != 0) {
+    // Single row, so the configured stride is never used.
+    gemmini_extended4_config_ld(tail * sizeof(float), MVIN_SCALE_IDENTITY, true, DIM, 0);
+    gemmini_extended4_config_ld(tail * sizeof(float), MVIN_SCALE_IDENTITY, true, DIM, 1);
+    group(rows * DIM, 1, tail, static_cast<uint32_t>(half * kHalfRows));
+  }
+  gemmini_fence();
+  asm volatile("fence" ::: "memory");
+  return true;
+}
 #else
 void SystolicAdd(char accelerator_mode __attribute__((unused)), bool relu, const elem_t* A, float A_scale, const elem_t* B,
                  float B_scale,
