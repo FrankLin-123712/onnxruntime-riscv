@@ -1340,6 +1340,98 @@ bool SystolicLayerNormRows(char accelerator_mode, const float* x, const float* g
 #endif
 }
 
+// GatedResidual epilogue (P6, HW-3 D-1) on the SoftAgg engine modes 2/3:
+//   y = x + logistic(g) * r [, relu(y)]
+// The engine replays the RV64 scalar MlasLogisticKernel instruction sequence,
+// then one multiply and one add, so results equal MlasComputeLogistic + Mul +
+// Add bitwise. Tensors are viewed as rows of 16 floats; each tile stages G, R
+// and X in the scratchpad, one RUN writes Y (and relu(Y)) rows to the
+// scratchpad, and they are stored back. The engine owns the local ports
+// exclusively: its RUN waits for the mvins, and later commands wait for it.
+size_t SystolicGatedResidual(char accelerator_mode, const float* x, const float* g, const float* r,
+                             float* y, float* y_relu, size_t count) {
+#if defined(__riscv) && defined(SYSTOLIC_FP32) && !defined(SYSTOLIC_FP16)
+  using namespace softagg;
+  if (accelerator_mode != 2 || count < DIM || !x || !g || !r || !y) return 0;
+  const auto overlaps = [](const void* a, const void* b, size_t bytes) {
+    const auto pa = reinterpret_cast<uintptr_t>(a), pb = reinterpret_cast<uintptr_t>(b);
+    return pa < pb + bytes && pb < pa + bytes;
+  };
+  const size_t bytes = count * sizeof(float);
+  for (const void* input : {static_cast<const void*>(x), static_cast<const void*>(g),
+                            static_cast<const void*>(r)}) {
+    if (overlaps(y, input, bytes) || (y_relu && overlaps(y_relu, input, bytes))) return 0;
+  }
+  if (y_relu && overlaps(y, y_relu, bytes)) return 0;
+  // Capability: SAG1 engine (bit2) with GR modes (bit3). Older bitstreams and
+  // plugins keep the CPU path. Checked once; the engine cannot disappear.
+  static int capable = -1;
+  if (capable < 0) {
+    asm volatile("fence" ::: "memory");
+    capable = (Status() & UINT64_C(0xffffffff0000000c)) == (kMagic | 0xc);
+  }
+  if (!capable) return 0;
+
+  ort_replay::Scope profile("kernel", "gated_residual.softagg",
+                            y_relu ? "GatedResidualDualOut" : "GatedResidual", "Gemmini");
+  constexpr uint32_t kTile = 768;  // G, R, X, Y, relu(Y): 5 x 768 <= 4096 SP rows
+  constexpr uint32_t kG = 0, kR = kTile, kX = 2 * kTile, kY = 3 * kTile;
+  const size_t rows = count / DIM;
+  const uint32_t mode = y_relu ? 3 : 2;
+  uint64_t commands = 0, runs = 0, polls = 0;
+  uint64_t engine_before[3] = {};
+  if (profile.Active()) for (uint64_t i = 0; i < 3; ++i) engine_before[i] = Status(i + 1);
+
+  asm volatile("fence" ::: "memory");
+  gemmini_extended4_config_ld(DIM * sizeof(float), MVIN_SCALE_IDENTITY, false, DIM, 0);
+  gemmini_extended_config_st(DIM * sizeof(float), NO_ACTIVATION, ACC_SCALE_IDENTITY);
+  // CONFIG: bias_s field = X base (stride S), bias_v unused; strides S=V=1.
+  ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, uint64_t(kX), (UINT64_C(1) << 32) | 1, 45);
+  commands += 3;
+  for (size_t row0 = 0; row0 < rows; row0 += kTile) {
+    const uint32_t n = static_cast<uint32_t>(std::min<size_t>(kTile, rows - row0));
+    const size_t offset = row0 * DIM;
+    for (uint32_t i = 0; i < n; i += DIM) {
+      const uint32_t m = std::min<uint32_t>(DIM, n - i);
+      gemmini_extended_mvin(g + offset + size_t(i) * DIM, kG + i, DIM, m);
+      gemmini_extended_mvin(r + offset + size_t(i) * DIM, kR + i, DIM, m);
+      gemmini_extended_mvin(x + offset + size_t(i) * DIM, kX + i, DIM, m);
+      commands += 3;
+    }
+    const uint64_t sources = (uint64_t(kR) << 32) | kG;
+    const uint64_t destination = (uint64_t(kY) << 32) | (uint64_t(n) << 16) | (uint64_t(DIM) << 8) | mode;
+    ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, sources, destination, 46);
+    ++commands; ++runs;
+    uint64_t status;
+    do { status = Status(); ++polls; } while (status & 2);
+    Require(!(status & 1), "SoftAgg GatedResidual RUN was rejected");
+    for (uint32_t i = 0; i < n; i += DIM) {
+      const uint32_t m = std::min<uint32_t>(DIM, n - i);
+      gemmini_extended_mvout(y + offset + size_t(i) * DIM, kY + i, DIM, m);
+      ++commands;
+      if (y_relu) {
+        gemmini_extended_mvout(y_relu + offset + size_t(i) * DIM, kY + n + i, DIM, m);
+        ++commands;
+      }
+    }
+  }
+  gemmini_fence();
+  asm volatile("fence" ::: "memory");
+  if (profile.Active()) {
+    std::ostringstream detail;
+    detail << "dtype=fp32;elements=" << rows * DIM << ";mode=" << mode << ";tile_rows=" << kTile
+           << ";runs=" << runs << ";status_polls=" << polls << ";rocc_commands=" << commands + polls;
+    const char* names[3] = {"engine_commands", "engine_read_rows", "engine_write_rows"};
+    for (uint64_t i = 0; i < 3; ++i) detail << ";" << names[i] << "=" << Status(i + 1) - engine_before[i];
+    profile.Detail(detail.str().c_str());
+  }
+  return rows * DIM;
+#else
+  (void)accelerator_mode; (void)x; (void)g; (void)r; (void)y; (void)y_relu; (void)count;
+  return 0;
+#endif
+}
+
 bool SystolicMatMulBias(char accelerator_mode, bool relu, const float* x, const float* w,
                         const float* bias, float* y, size_t M, size_t K, size_t N) {
 #if defined(__riscv) && defined(SYSTOLIC_FP32) && !defined(SYSTOLIC_FP16)

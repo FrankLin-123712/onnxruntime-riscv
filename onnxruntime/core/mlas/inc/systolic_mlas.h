@@ -61,6 +61,16 @@ bool SystolicLayerNormRows(char accelerator_mode, const float* x, const float* g
 bool SystolicMatMulBias(char accelerator_mode, bool relu, const float* x, const float* w,
                         const float* bias, float* y, size_t M, size_t K, size_t N);
 
+// GatedResidual epilogue (P6): y = x + logistic(g) * r and, when y_relu is
+// non-null, y_relu = (y < 0 ? +0 : y), on the SoftAgg engine modes 2/3. The
+// logistic is the RV64 scalar MlasLogisticKernel sequence, so outputs equal
+// MlasComputeLogistic + Mul + Add (+ store ReLU) bitwise. Processes the first
+// floor(count / 16) * 16 elements and returns that number; the caller handles
+// the rest. Returns 0 (no instructions, no writes) unless mode 2 on hardware
+// that advertises the GR modes, or if an output overlaps any other tensor.
+size_t SystolicGatedResidual(char accelerator_mode, const float* x, const float* g, const float* r,
+                             float* y, float* y_relu, size_t count);
+
 #ifdef SYSTOLIC_INT8
 
 void SystolicMultiply
