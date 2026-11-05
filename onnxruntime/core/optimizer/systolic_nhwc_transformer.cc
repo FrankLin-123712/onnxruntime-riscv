@@ -6,6 +6,7 @@
 #include "core/graph/graph_utils.h"
 #include "core/optimizer/initializer.h"
 #include "core/optimizer/systolic_nhwc_transformer.h"
+#include "core/mlas/inc/systolic_feature_flags.h"
 
 using namespace ONNX_NAMESPACE;
 using namespace ::onnxruntime::common;
@@ -308,7 +309,9 @@ void SystolicNhwcTransformerImpl::TransformConv(Node& node, const logging::Logge
 void SystolicNhwcTransformerImpl::TransformPassThrough(Node& node, const logging::Logger& logger) {
   // CPU Relu is layout independent; keep it on the CPU without transposes.
   const auto* input_type = node.InputDefs()[0]->TypeAsProto();
-  const bool cpu_float_relu = node.OpType() == "Relu" && node.Domain() == kOnnxDomain &&
+  // Ablation (S19): without NHWC propagation, CPU Relu is not exempt.
+  const bool cpu_float_relu = SystolicFeatureEnabled("ORT_SYSTOLIC_NHWC_PROPAGATE") &&
+      node.OpType() == "Relu" && node.Domain() == kOnnxDomain &&
       node.GetExecutionProviderType() == kCpuExecutionProvider && input_type &&
       input_type->has_tensor_type() &&
       input_type->tensor_type().elem_type() == ONNX_NAMESPACE::TensorProto_DataType_FLOAT;
@@ -430,7 +433,9 @@ void SystolicNhwcTransformerImpl::TransformInstanceNormalization(Node& node,
                              "InstanceNormalization_nhwc", "FP32 NHWC InstanceNormalization",
                              node.MutableInputDefs(), node.MutableOutputDefs(), &node.GetAttributes(), kOnnxDomain);
 #if defined(SYSTOLIC_FP32) && defined(GEMMINI_NHWC_NORM)
-  nhwc.SetExecutionProviderType(kSystolicExecutionProvider);
+  // Ablation (H3): ORT_SYSTOLIC_NHWC_NORM=0 keeps the NHWC IN on the CPU kernel.
+  nhwc.SetExecutionProviderType(SystolicFeatureEnabled("ORT_SYSTOLIC_NHWC_NORM")
+                                    ? kSystolicExecutionProvider : kCpuExecutionProvider);
 #else
   nhwc.SetExecutionProviderType(kCpuExecutionProvider);
 #endif
@@ -632,6 +637,7 @@ void SystolicNhwcTransformerImpl::TransformMaxPool(Node& node, const logging::Lo
 }
 
 void SystolicNhwcTransformerImpl::Transform(Node& node, const logging::Logger& logger) {
+  const bool nhwc_propagate = SystolicFeatureEnabled("ORT_SYSTOLIC_NHWC_PROPAGATE");
   if (node.OpType() == "QLinearConv") {
     TransformConv<int8_t, ONNX_NAMESPACE::TensorProto_DataType_INT8>(node, logger, /*weightIdx= */ 3, /*biasIdx= */ 8);
   } else if (node.OpType() == "Conv") {
@@ -640,11 +646,11 @@ void SystolicNhwcTransformerImpl::Transform(Node& node, const logging::Logger& l
     } else {
       TransformConv<float, ONNX_NAMESPACE::TensorProto_DataType_FLOAT>(node, logger, 1, 2);
     }
-  } else if (node.OpType() == "Relu") {
+  } else if (node.OpType() == "Relu" && nhwc_propagate) {
     if (!FuseReluWithNhwcProducer(node, logger) && !FuseReluWithFloatAdd(node, logger)) {
       TransformPassThrough(node, logger);
     }
-  } else if (node.OpType() == "InstanceNormalization") {
+  } else if (node.OpType() == "InstanceNormalization" && nhwc_propagate) {
     TransformInstanceNormalization(node, logger);
   } else if (node.GetInputEdgesCount() == 0 && node.InputDefs().size() != 0) {
     // The following transforms only run when the input edge count has already
@@ -652,9 +658,12 @@ void SystolicNhwcTransformerImpl::Transform(Node& node, const logging::Logger& l
     // node may already have all inputs converted to NHWC format and is not
     // needed for correct operation. This avoids doing extra string checks for
     // nodes unrelated to this transformer.
-    if (node.OpType() == "QLinearRelu") {
+    // Ablation (S19): with ORT_SYSTOLIC_NHWC_PROPAGATE=0, Relu returns to the
+    // pre-S19 pass-through rule and FP32 Add/InstanceNorm stay in NCHW, so
+    // Finalize() inserts the reorders around them as before.
+    if (node.OpType() == "QLinearRelu" || (node.OpType() == "Relu" && !nhwc_propagate)) {
       TransformPassThrough(node, logger);
-    } else if (node.OpType() == "Add") {
+    } else if (node.OpType() == "Add" && nhwc_propagate) {
       TransformFloatAdd(node, logger);
     } else if (node.OpType() == "QLinearAdd") {
       TransformQLinearAdd(node, logger);
@@ -683,9 +692,11 @@ void SystolicNhwcTransformerImpl::Finalize(bool& modified, const logging::Logger
   }
   std::unordered_set<NodeIndex> replaced_pointwise_producers;
 
+  // Ablation (S21): ORT_SYSTOLIC_CONV1X1_NCHW=0 keeps the NHWC head + Transpose.
+  const bool conv1x1_nchw = SystolicFeatureEnabled("ORT_SYSTOLIC_CONV1X1_NCHW");
   auto emit_nchw_pointwise_head = [&](NhwcArgument& output, NodeArg* original_arg) {
     auto& producer = output.output_node_;
-    if (pretraining_pass_ ||
+    if (pretraining_pass_ || !conv1x1_nchw ||
         output.starting_original_uses_ != output.remaining_original_uses_ ||
         visible_original_outputs[producer.Index()] != 1 ||
         replaced_pointwise_producers.count(producer.Index()) != 0 ||

@@ -5,6 +5,8 @@
 #include "core/framework/op_kernel.h"
 #include "core/framework/kernel_registry.h"
 #include "core/mlas/inc/mlas.h"
+#include "core/mlas/inc/systolic_feature_flags.h"
+#include <algorithm>
 #include "systolic_fwd.h"
 #ifdef SYSTOLIC_FP16
 #include "core/mlas/inc/systolic_fp16.h"
@@ -157,6 +159,23 @@ SystolicExecutionProvider::GetCapability(const onnxruntime::GraphViewer& graph,
                                     const std::vector<const KernelRegistry*>& kernel_registries) const {
   std::vector<std::unique_ptr<ComputeCapability>>
       result = IExecutionProvider::GetCapability(graph, kernel_registries);
+
+#ifdef SYSTOLIC_FP32
+  // Ablation (S20): ORT_SYSTOLIC_FP32_ADD=0 leaves every FP32 Add/AddRelu to
+  // the CPU EP, exactly as before the Systolic Add kernel existed. This also
+  // restores ORT's LayerNormFusion, which the Systolic Add had blocked by
+  // splitting the LayerNorm pattern across two EPs.
+  if (!SystolicFeatureEnabled("ORT_SYSTOLIC_FP32_ADD")) {
+    result.erase(std::remove_if(result.begin(), result.end(),
+        [&](const std::unique_ptr<ComputeCapability>& capability) {
+          const auto& nodes = capability->sub_graph->nodes;
+          if (nodes.size() != 1) return false;
+          const auto* node = graph.GetNode(nodes[0]);
+          return node && node->Domain() == kOnnxDomain &&
+                 (node->OpType() == "Add" || node->OpType() == "AddRelu");
+        }), result.end());
+  }
+#endif
 
   for (auto& rule : fuse_rules_) {
     rule(graph, result);

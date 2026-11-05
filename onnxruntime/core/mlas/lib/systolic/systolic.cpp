@@ -1,4 +1,5 @@
 #include <limits>
+#include "core/mlas/inc/systolic_feature_flags.h"
 
 #ifdef SYSTOLIC_FP16
 // FP16 implementation shared by ORT and standalone replay binaries.
@@ -286,11 +287,16 @@ bool SystolicConvRect(char accelerator_mode, int64_t batch,
       output_channels, output_h, output_w, kernel, stride, padding};
   if (accelerator_mode != 2 || !input || !weights || !output ||
       !systolic_rect::Supported(s)) return false;
-  const auto tile = systolic_rect::SelectTile(s, DIM, BANK_NUM * BANK_ROWS, ACC_ROWS);
+  // Ablation (S18): ORT_SYSTOLIC_CONV_TILE_SEARCH=0 keeps the stage-1 fixed tile.
+  static const bool tile_search = SystolicFeatureEnabled("ORT_SYSTOLIC_CONV_TILE_SEARCH");
+  const auto tile = tile_search
+      ? systolic_rect::SelectTile(s, DIM, BANK_NUM * BANK_ROWS, ACC_ROWS)
+      : systolic_rect::FixedTile(s, DIM, BANK_NUM * BANK_ROWS, ACC_ROWS);
   if (!tile.rows) return false;
   ort_replay::Scope profile("kernel", "conv.direct", "Conv", "SystolicExecutionProvider");
   if (profile.Active()) {
-    const std::string detail = "path=direct_conv;layout=NHWC;abi=rect_v1;tiling=capacity_v2;tile=" +
+    const std::string detail = std::string("path=direct_conv;layout=NHWC;abi=rect_v1;tiling=") +
+        (tile_search ? "capacity_v2" : "fixed_v1") + ";tile=" +
         std::to_string(tile.rows) + "x" + std::to_string(tile.cols) + "x" +
         std::to_string(tile.ci) + "x" + std::to_string(tile.co) +
         ";loops=" + std::to_string(static_cast<uint64_t>(systolic_rect::LoopCount(s, tile))) +

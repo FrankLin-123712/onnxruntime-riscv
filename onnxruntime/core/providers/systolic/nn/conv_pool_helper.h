@@ -1,4 +1,5 @@
 #include "core/mlas/inc/mlas.h"
+#include "core/mlas/inc/systolic_feature_flags.h"
 #include "core/util/math.h"
 #include "core/util/math_cpuonly.h"
 #include "core/common/exceptions.h"
@@ -36,6 +37,11 @@ inline bool TryConvOnSystolic(char accelerator_mode,
                               const PoolAttributes *pool_attrs_,
                               float output_scale) {
 #ifdef SYSTOLIC_FP32
+  // Ablation (S17): ORT_SYSTOLIC_CONV_RECT=0 restores the pre-S17 FP32
+  // behaviour for DPVO, whose feature maps are all rectangular: the direct
+  // conv gate rejects them and every Conv takes the im2col+matmul fallback.
+  static const bool rect_enabled = SystolicFeatureEnabled("ORT_SYSTOLIC_CONV_RECT");
+  if (!rect_enabled) return false;
   // Square and rectangular feature maps share the rectangular LoopConv ABI.
   // Unsupported modes/attributes retain the im2col+matmul fallback.
   if (accelerator_mode != 2 || groups != 1 ||
